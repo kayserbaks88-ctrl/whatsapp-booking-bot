@@ -12,7 +12,7 @@ SERVICES = {
 }
 
 SHOP = {
-    "name": "BBC Barbers",
+    "name": "TrimTech AI",
     "address": "12 High Street",
     "currency": "£",
     "open_hours": {  # 24h clock

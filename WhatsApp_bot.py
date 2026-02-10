@@ -1,6 +1,8 @@
 import os
 import re
-from datetime import datetime
+import threading
+import time as time_mod
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
 import dateparser
@@ -8,335 +10,534 @@ from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
 
-from calendar_helper import create_booking_event
+from calendar_helper import create_booking_event, delete_booking_event
 
 load_dotenv()
 
 # ----------------------------
 # Config
 # ----------------------------
-BUSINESS_NAME = os.getenv("BUSINESS_NAME", "BBC Barbers")
+BUSINESS_NAME = os.getenv("BUSINESS_NAME", "TrimTech AI")
 TIMEZONE = os.getenv("TIMEZONE_HINT", "Europe/London")
+TZ = ZoneInfo(TIMEZONE)
+
 CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 PORT = int(os.getenv("PORT", "5000"))
 
+DEFAULT_SERVICE_MINUTES = int(os.getenv("DEFAULT_SERVICE_MINUTES", "45"))
+SLOT_STEP_MINUTES = int(os.getenv("SLOT_STEP_MINUTES", "15"))
+
+# Reminders: 1 hour + 30 mins
+REMINDER_1 = int(os.getenv("REMINDER_1", "60"))
+REMINDER_2 = int(os.getenv("REMINDER_2", "30"))
+ENABLE_REMINDERS = os.getenv("ENABLE_REMINDERS", "1") == "1"
+
+# Twilio REST (for outbound reminders)
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")  # e.g. "whatsapp:+14155238886" or your approved number
+
+try:
+    from twilio.rest import Client as TwilioClient
+except Exception:
+    TwilioClient = None
+
+# Shop hours: Mon–Sat 9–6, Sun closed
+SHOP_HOURS = {
+    0: (time(9, 0), time(18, 0)),  # Mon
+    1: (time(9, 0), time(18, 0)),  # Tue
+    2: (time(9, 0), time(18, 0)),  # Wed
+    3: (time(9, 0), time(18, 0)),  # Thu
+    4: (time(9, 0), time(18, 0)),  # Fri
+    5: (time(9, 0), time(18, 0)),  # Sat
+    6: None,                       # Sun closed
+}
+
 SERVICES = ["Haircut", "Skin Fade", "Beard Trim", "Kids Cut", "Shape Up"]
+
+SERVICE_DURATIONS = {
+    "Haircut": 45,
+    "Skin Fade": 60,
+    "Beard Trim": 30,
+    "Kids Cut": 30,
+    "Shape Up": 30,
+}
+
+# Prices (shown in menu + confirmation)
+SERVICE_PRICES = {
+    "Haircut": "£18",
+    "Skin Fade": "£22",
+    "Beard Trim": "£10",
+    "Kids Cut": "£12",
+    "Shape Up": "£8",
+}
+
+# NOTE: match longer phrases first (fixes "kids cut" being detected as "cut")
 SERVICE_ALIASES = {
-    "kids cut": "Kids Cut",
-    "kids": "Kids Cut",
-
     "skin fade": "Skin Fade",
-    "fade": "Skin Fade",
-
     "beard trim": "Beard Trim",
-    "beard": "Beard Trim",
-
+    "kids cut": "Kids Cut",
+    "kid cut": "Kids Cut",
+    "kids haircut": "Kids Cut",
+    "child cut": "Kids Cut",
     "shape up": "Shape Up",
     "line up": "Shape Up",
+    "lineup": "Shape Up",
 
     "haircut": "Haircut",
-    "cut": "Haircut",   # keep this LAST
+    "beard": "Beard Trim",
+    "kids": "Kids Cut",
+    "fade": "Skin Fade",
+    "cut": "Haircut",
 }
 
 # ----------------------------
-# In-memory session state
+# In-memory storage
 # ----------------------------
-# Each phone number maps to a dict like:
-# { "state": "...", "service": "...", "when": datetime, "name": "..." }
-user_sessions = {}
+# phone -> state for booking flow
+user_state = {}
 
-app = Flask(__name__)
+# phone -> active booking info (used for reminders & cancel)
+# {
+#   "service": str,
+#   "dt": iso str,
+#   "name": str,
+#   "event_id": str,
+#   "link": str,
+#   "rem1_sent": bool,
+#   "rem2_sent": bool
+# }
+active_bookings = {}
 
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def norm(text: str) -> str:
-    """Normalize text safely (emoji-safe)."""
-    t = (text or "").strip().lower()
-    t = re.sub(r"\s+", " ", t)
-    return t
+def norm(t: str) -> str:
+    return re.sub(r"\s+", " ", (t or "").strip().lower())
 
+def pretty_hours_one_line() -> str:
+    return "Hours: Mon–Sat 9am–6pm | Sun Closed"
 
-def detect_service(text):
-    t = text.lower()
+def pretty_hours_block() -> str:
+    return "Opening hours:\nMon–Sat: 9am–6pm\nSun: Closed"
 
-    for key in sorted(SERVICE_ALIASES.keys(), key=len, reverse=True):
-        if key in t:
-            return SERVICE_ALIASES[key]
-    return None
+def brand_header() -> str:
+    return "💈 BBC Barbers\nPowered by TrimTech AI"
 
-def extract_service(text: str):
-    return detect_service(text)
+def reset_user(phone: str):
+    user_state.pop(phone, None)
 
-def is_yes(text: str) -> bool:
-    t = norm(text)
-    return t in {"yes", "y", "yeah", "yep", "ok", "okay", "confirm", "sure", "go ahead"}
+def get_or_init(phone: str):
+    if phone not in user_state:
+        user_state[phone] = {"step": "MENU", "service": None, "dt": None, "name": None, "suggestions": None}
+    return user_state[phone]
 
+def is_within_open_hours(dt: datetime) -> bool:
+    dt = dt.astimezone(TZ)
+    hours = SHOP_HOURS.get(dt.weekday())
+    if not hours:
+        return False
+    start_t, end_t = hours
+    return (start_t <= dt.time() < end_t)
 
-def is_no(text: str) -> bool:
-    t = norm(text)
-    return t in {"no", "n", "nope", "nah", "cancel"}
+def round_up_to_step(dt: datetime, step_minutes: int) -> datetime:
+    dt = dt.replace(second=0, microsecond=0)
+    rem = dt.minute % step_minutes
+    if rem == 0:
+        return dt
+    return dt + timedelta(minutes=(step_minutes - rem))
 
+def next_open_slot(after_dt: datetime) -> datetime:
+    dt = round_up_to_step(after_dt.astimezone(TZ), SLOT_STEP_MINUTES)
+    now = datetime.now(TZ).replace(second=0, microsecond=0)
+    if dt < now:
+        dt = round_up_to_step(now, SLOT_STEP_MINUTES)
 
-def is_change(text: str) -> bool:
-    t = norm(text)
-    return t.startswith("change") or t in {"edit", "modify"}
+    for _ in range(14 * 24 * 60 // SLOT_STEP_MINUTES):
+        hours = SHOP_HOURS.get(dt.weekday())
+        if hours:
+            start_t, end_t = hours
+            if dt.time() < start_t:
+                dt = dt.replace(hour=start_t.hour, minute=start_t.minute, second=0, microsecond=0)
+                dt = round_up_to_step(dt, SLOT_STEP_MINUTES)
+            if start_t <= dt.time() < end_t:
+                return dt
+        dt = dt + timedelta(minutes=SLOT_STEP_MINUTES)
 
+    return round_up_to_step(datetime.now(TZ), SLOT_STEP_MINUTES)
 
-def is_reset(text: str) -> bool:
-    t = norm(text)
-    return t in {"reset", "restart", "start over", "start", "menu"}
-
-
-def try_extract_name(text: str):
-    """
-    Accepts:
-    - "my name is John"
-    - "i am John"
-    - "John"
-    - "John Smith"
-    """
-    raw = (text or "").strip()
-    t = norm(raw)
-
-    # common patterns
-    patterns = [
-        r"^my name is ([a-zA-Z][a-zA-Z\s'\-]{1,40})$",
-        r"^i am ([a-zA-Z][a-zA-Z\s'\-]{1,40})$",
-        r"^im ([a-zA-Z][a-zA-Z\s'\-]{1,40})$",
-        r"^it's ([a-zA-Z][a-zA-Z\s'\-]{1,40})$",
-        r"^its ([a-zA-Z][a-zA-Z\s'\-]{1,40})$",
-    ]
-    for p in patterns:
-        m = re.match(p, t)
-        if m:
-            name = m.group(1).strip()
-            return name.title()
-
-    # if it's just a couple words and contains letters, treat as name
-    if re.match(r"^[a-zA-Z][a-zA-Z\s'\-]{1,40}$", raw) and len(raw.split()) <= 3:
-        return raw.strip().title()
-
-    return None
-
-
-def parse_datetime_flexible(text: str):
-    """
-    Parse date/time from free text like:
-    - tomorrow 3pm
-    - friday at 1
-    - 6 jan 16:00
-    """
-    tz = ZoneInfo(TIMEZONE)
-    now = datetime.now(tz)
-
+def parse_datetime(text: str) -> datetime | None:
     settings = {
         "TIMEZONE": TIMEZONE,
         "RETURN_AS_TIMEZONE_AWARE": True,
         "PREFER_DATES_FROM": "future",
-        "RELATIVE_BASE": now,
     }
-
     dt = dateparser.parse(text, settings=settings)
     if not dt:
         return None
+    return dt.astimezone(TZ)
 
-    # normalize timezone
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=tz)
-    return dt
+def service_from_text(text: str) -> str | None:
+    """
+    Fix for 'kids cut' being detected as 'cut' (Haircut):
+    - numeric selection first
+    - exact match second
+    - alias match third (longest keys first)
+    """
+    t = norm(text)
 
+    # 1) Numeric selection
+    if t.isdigit():
+        i = int(t) - 1
+        if 0 <= i < len(SERVICES):
+            return SERVICES[i]
 
-def fmt_when(dt: datetime) -> str:
-    return dt.astimezone(ZoneInfo(TIMEZONE)).strftime("%a %d %b at %I:%M %p")
+    # 2) Exact match to service names
+    for s in SERVICES:
+        if norm(s) == t:
+            return s
 
+    # 3) Alias match (longest first)
+    for k in sorted(SERVICE_ALIASES.keys(), key=len, reverse=True):
+        if k in t:
+            return SERVICE_ALIASES[k]
 
-def welcome_menu() -> str:
+    return None
+
+def fmt_dt(dt: datetime) -> str:
+    return dt.astimezone(TZ).strftime("%a %d %b, %I:%M %p").lstrip("0").replace(" 0", " ")
+
+def menu_text() -> str:
+    lines = [
+        brand_header(),
+        "",
+        "Choose a service:",
+    ]
+    for i, s in enumerate(SERVICES, start=1):
+        price = SERVICE_PRICES.get(s, "")
+        if price:
+            lines.append(f"{i}) {s} — {price}")
+        else:
+            lines.append(f"{i}) {s}")
+
+    lines += [
+        "",
+        "Reply with a number or service name.",
+        pretty_hours_one_line(),
+    ]
+    return "\n".join(lines)
+
+def confirm_text(st) -> str:
+    dt: datetime = st["dt"]
+    s = st["service"]
+    name = st.get("name") or "Customer"
+    price = SERVICE_PRICES.get(s, "")
+    service_line = f"{s}" + (f" — {price}" if price else "")
+
     return (
-        f"👋 Welcome to {BUSINESS_NAME}!\n"
-        f"What service would you like?\n\n"
-        f"✂️ Haircut\n"
-        f"💈 Skin Fade\n"
-        f"🧔 Beard Trim\n"
-        f"👶 Kids Cut\n"
-        f"📏 Shape Up\n\n"
-        f"Type: Haircut / Skin Fade / Beard Trim / Kids Cut / Shape Up"
+        "Please confirm:\n\n"
+        "💈 BBC Barbers\n"
+        f"Service: {service_line}\n"
+        f"📅 {fmt_dt(dt)}\n"
+        f"Name: {name}\n\n"
+        "Reply:\n"
+        "YES – confirm\n"
+        "CHANGE – new time\n"
+        "NO – cancel"
     )
 
+def can_send_outbound() -> bool:
+    return bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM and TwilioClient)
 
-def get_session(phone: str) -> dict:
-    if phone not in user_sessions:
-        user_sessions[phone] = {"state": "awaiting_service"}
-    return user_sessions[phone]
-
-
-def reset_session(phone: str):
-    user_sessions[phone] = {"state": "awaiting_service"}
+def send_whatsapp(to_phone: str, body: str) -> bool:
+    """Sends outbound WhatsApp message (for reminders)."""
+    if not can_send_outbound():
+        return False
+    try:
+        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        client.messages.create(
+            from_=TWILIO_WHATSAPP_FROM,
+            to=to_phone,
+            body=body,
+        )
+        return True
+    except Exception:
+        return False
 
 
 # ----------------------------
-# Main handler
+# Reminder Loop
 # ----------------------------
-@app.route("/whatsapp", methods=["POST"])
-def whatsapp():
-    incoming_msg = request.values.get("Body", "") or ""
-    phone = request.values.get("From", "") or ""
+def reminder_loop():
+    while True:
+        try:
+            now = datetime.now(TZ)
+            for phone, b in list(active_bookings.items()):
+                try:
+                    dt = datetime.fromisoformat(b["dt"]).astimezone(TZ)
+                except Exception:
+                    continue
 
-    session = get_session(phone)
-    state = session.get("state", "awaiting_service")
+                # If booking already passed, cleanup
+                if dt < now - timedelta(minutes=5):
+                    active_bookings.pop(phone, None)
+                    continue
 
-    msg_norm = norm(incoming_msg)
+                mins_to = int((dt - now).total_seconds() // 60)
+                service = b.get("service", "appointment")
+                price = SERVICE_PRICES.get(service, "")
+                service_line = f"{service}" + (f" — {price}" if price else "")
 
-    # Global commands
-    if is_reset(msg_norm):
-        reset_session(phone)
-        resp = MessagingResponse()
-        resp.message("✅ Reset done.\n\n" + welcome_menu())
+                # 1 hour reminder
+                if (not b.get("rem1_sent")) and (REMINDER_1 - 1 <= mins_to <= REMINDER_1 + 1):
+                    msg = (
+                        "⏰ Reminder — BBC Barbers\n\n"
+                        f"{b.get('name','Customer')}, your appointment is in 1 hour\n"
+                        f"{service_line}\n"
+                        f"📅 {fmt_dt(dt)}\n\n"
+                        "Reply CANCEL if you can’t make it.\n"
+                        "Powered by TrimTech AI"
+                    )
+                    if send_whatsapp(phone, msg):
+                        b["rem1_sent"] = True
+
+                # 30 min reminder
+                if (not b.get("rem2_sent")) and (REMINDER_2 - 1 <= mins_to <= REMINDER_2 + 1):
+                    msg = (
+                        "⏰ See you soon — BBC Barbers\n\n"
+                        f"{b.get('name','Customer')}, your appointment is in 30 minutes\n"
+                        f"{service_line}\n"
+                        f"📅 {fmt_dt(dt)}\n\n"
+                        "Reply CANCEL if needed.\n"
+                        "Powered by TrimTech AI"
+                    )
+                    if send_whatsapp(phone, msg):
+                        b["rem2_sent"] = True
+
+        except Exception:
+            pass
+
+        time_mod.sleep(60)
+
+
+# ----------------------------
+# Flask App
+# ----------------------------
+app = Flask(__name__)
+
+@app.get("/")
+def health():
+    return "OK", 200
+
+@app.post("/whatsapp")
+def whatsapp_webhook():
+    incoming = request.values.get("Body", "")
+    phone = request.values.get("From", "")
+    t = norm(incoming)
+
+    resp = MessagingResponse()
+    msg = resp.message()
+
+    st = get_or_init(phone)
+
+    # -------- Global commands
+    if t in {"start", "restart", "reset", "menu"}:
+        reset_user(phone)
+        st = get_or_init(phone)
+        msg.body(menu_text())
         return str(resp)
 
-    # Allow "change" at any time (puts them back to choosing what to change)
-    if is_change(msg_norm):
-        session["state"] = "awaiting_change_field"
-        resp = MessagingResponse()
-        resp.message(
-            "No problem — what would you like to change?\n"
-            "Type: service / time / name"
+    if t == "view":
+        b = active_bookings.get(phone)
+        if b and b.get("link"):
+            # WhatsApp may still preview URLs sometimes, but this keeps it clean.
+            msg.body(f"Your booking link:\n👉 {b['link']}\n\nReply MENU to return.")
+        else:
+            msg.body("No booking link saved yet. Book first, then reply VIEW.")
+        return str(resp)
+
+    # CANCEL (delete calendar event)
+    if t == "cancel":
+        b = active_bookings.get(phone)
+        if not b or not b.get("event_id"):
+            reset_user(phone)
+            msg.body("No active booking found to cancel. Reply MENU to start.")
+            return str(resp)
+
+        ok, m = delete_booking_event(CALENDAR_ID, b["event_id"])
+        if ok:
+            active_bookings.pop(phone, None)
+            reset_user(phone)
+            msg.body("✅ Cancelled — your appointment has been removed.\nReply MENU to book again.")
+        else:
+            msg.body(f"⚠️ I couldn’t cancel it automatically: {m}\nReply MENU or try again.")
+        return str(resp)
+
+    # -------- Flow steps
+    step = st.get("step", "MENU")
+
+    # Step: MENU
+    if step == "MENU":
+        svc = service_from_text(incoming)
+        if not svc:
+            msg.body(menu_text())
+            return str(resp)
+
+        st["service"] = svc
+        st["step"] = "ASK_DATETIME"
+        msg.body(
+            f"💈 BBC Barbers — {svc}\n\n"
+            f"{pretty_hours_block()}\n\n"
+            "📅 What day & time would you like?\n"
+            "Examples:\n"
+            "• Tomorrow 2pm\n"
+            "• Sat 7 Feb 1pm\n"
+            "• 10/02 15:30"
         )
         return str(resp)
 
-    reply = ""
-
-    # ----------------------------
-    # State: awaiting_service
-    # ----------------------------
-    if state == "awaiting_service":
-        service = extract_service(incoming_msg)
-        if service:
-            session["service"] = service
-            session["state"] = "awaiting_time"
-            reply = (
-                f"✅ {service} selected.\n"
-                f"What day & time would you like?\n\n"
-                f"Examples:\n"
-                f"• tomorrow 3pm\n"
-                f"• friday at 1\n"
-                f"• 6 jan 16:00"
-            )
+    # Step: ASK_DATETIME
+    if step == "ASK_DATETIME":
+        # Handle 1/2/3 suggestions
+        if t in {"1", "2", "3"} and st.get("suggestions"):
+            idx = int(t) - 1
+            try:
+                dt = datetime.fromisoformat(st["suggestions"][idx]).astimezone(TZ)
+            except Exception:
+                dt = None
         else:
-            # Don't say "I didn't catch that" for greetings etc — just show menu.
-            reply = welcome_menu()
+            dt = parse_datetime(incoming)
 
-    # ----------------------------
-    # State: awaiting_time
-    # ----------------------------
-    elif state == "awaiting_time":
-        dt = parse_datetime_flexible(incoming_msg)
-        if dt:
-            session["when"] = dt
-            session["state"] = "awaiting_name"
-            reply = (
-                f"✅ Got it: {fmt_when(dt)}.\n"
-                f"What's your name?"
-            )
-        else:
-            reply = (
-                "I didn’t catch the time 🤔\n"
+        if not dt:
+            msg.body(
+                "Sorry — I couldn't understand that time.\n\n"
                 "Try:\n"
-                "• tomorrow 3pm\n"
-                "• friday at 1\n"
-                "• 6 jan 16:00\n\n"
-                "Or type 'reset' to start over."
+                "• Tomorrow 2pm\n"
+                "• Sat 7 Feb 1pm\n"
+                "• 10/02 15:30"
             )
+            return str(resp)
 
-    # ----------------------------
-    # State: awaiting_name
-    # ----------------------------
-    elif state == "awaiting_name":
-        name = try_extract_name(incoming_msg)
-        if name:
-            session["name"] = name
-            session["state"] = "awaiting_confirm"
-            service = session.get("service", "Service")
-            when = session.get("when")
-            reply = (
-                "Please confirm your booking:\n\n"
-                f"• Service: {service}\n"
-                f"• Time: {fmt_when(when)}\n"
-                f"• Name: {name}\n\n"
-                "Reply YES to confirm or NO to cancel.\n"
-                "You can also type CHANGE to edit."
+        now = datetime.now(TZ)
+        if dt < now + timedelta(minutes=5):
+            suggested = next_open_slot(now + timedelta(minutes=15))
+            msg.body(
+                "That time is too soon / in the past.\n"
+                f"Try this instead: {fmt_dt(suggested)}\n\n"
+                "Reply with a new day & time."
             )
-        else:
-            reply = "What name should I put the booking under? (e.g. John or John Smith)"
+            return str(resp)
 
-    # ----------------------------
-    # State: awaiting_confirm
-    # ----------------------------
-    elif state == "awaiting_confirm":
-        if is_yes(msg_norm):
-            service = session.get("service", "Service")
-            when = session.get("when")
-            name = session.get("name", "Customer")
+        if not is_within_open_hours(dt):
+            a = next_open_slot(dt)
+            b = next_open_slot(a + timedelta(minutes=SLOT_STEP_MINUTES))
+            c = next_open_slot(b + timedelta(minutes=SLOT_STEP_MINUTES))
+            st["suggestions"] = [a.isoformat(), b.isoformat(), c.isoformat()]
+            msg.body(
+                "⛔ We’re closed at that time.\n\n"
+                f"{pretty_hours_block()}\n\n"
+                "Next available:\n"
+                f"1) {fmt_dt(a)}\n"
+                f"2) {fmt_dt(b)}\n"
+                f"3) {fmt_dt(c)}\n\n"
+                "Reply 1, 2, 3 — or send another day & time."
+            )
+            return str(resp)
 
-            ok, message, link = create_booking_event(
-                service_name=service,
+        st["dt"] = dt
+        st["suggestions"] = None
+        st["step"] = "ASK_NAME"
+        msg.body(f"✅ Time held: {fmt_dt(dt)}\n\nWhat’s your name?")
+        return str(resp)
+
+    # Step: ASK_NAME
+    if step == "ASK_NAME":
+        name = incoming.strip()
+        name = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ '\-]", "", name).strip()
+
+        if len(name) < 2:
+            msg.body("Please send your name (e.g. Ty).")
+            return str(resp)
+
+        st["name"] = name
+        st["step"] = "CONFIRM"
+        msg.body(confirm_text(st))
+        return str(resp)
+
+    # Step: CONFIRM
+    if step == "CONFIRM":
+        if t == "no":
+            reset_user(phone)
+            msg.body("Cancelled. Reply MENU to start again.")
+            return str(resp)
+
+        if t == "change":
+            st["dt"] = None
+            st["step"] = "ASK_DATETIME"
+            msg.body(f"Sure — send the new day & time you want.\n\n{pretty_hours_block()}")
+            return str(resp)
+
+        if t == "yes":
+            service_name = st["service"]
+            when = st["dt"]
+            name = st.get("name") or "Customer"
+            duration = SERVICE_DURATIONS.get(service_name, DEFAULT_SERVICE_MINUTES)
+
+            ok, message, link, event_id = create_booking_event(
+                service_name=service_name,
                 when=when,
                 name=name,
                 phone=phone,
                 calendar_id=CALENDAR_ID,
-                timezone_hint=TIMEZONE,
+                duration_minutes=duration,
+                timezone=TIMEZONE,
             )
 
             if ok:
-                reply = f"✅ Confirmed! You’re booked for {fmt_when(when)}.\nSee you soon, {name}!"
-                if link:
-                    reply += f"\n\n📅 Calendar link:\n{link}"
-            else:
-                reply = (
-                    "⚠️ I couldn’t create the booking in the calendar.\n"
-                    f"Reason: {message}\n\n"
-                    "Type RESET to try again."
+                active_bookings[phone] = {
+                    "service": service_name,
+                    "dt": when.isoformat(),
+                    "name": name,
+                    "event_id": event_id,
+                    "link": link,
+                    "rem1_sent": False,
+                    "rem2_sent": False,
+                }
+                reset_user(phone)
+
+                price = SERVICE_PRICES.get(service_name, "")
+                service_line = f"{service_name}" + (f" — {price}" if price else "")
+
+                msg.body(
+                    f"✅ Confirmed — thank you {name}\n\n"
+                    "💈 BBC Barbers\n"
+                    f"Service: {service_line}\n"
+                    f"📅 {fmt_dt(when)}\n\n"
+                    "• Reminders at 1 hour & 30 mins\n"
+                    "• Reply CANCEL to cancel\n"
+                    "• Reply VIEW for booking link\n\n"
+                    "Powered by TrimTech AI"
                 )
+            else:
+                msg.body(f"Booking failed: {message}\n\nReply MENU to try again.")
+            return str(resp)
 
-            # End the session cleanly so it doesn't loop:
-            reset_session(phone)
+        # Anything else -> re-show confirm
+        msg.body(confirm_text(st))
+        return str(resp)
 
-        elif is_no(msg_norm):
-            reply = "❌ No worries — booking cancelled.\n\n" + welcome_menu()
-            reset_session(phone)
-        else:
-            reply = "Please reply YES to confirm or NO to cancel. (Or type CHANGE to edit.)"
-
-    # ----------------------------
-    # State: awaiting_change_field
-    # ----------------------------
-    elif state == "awaiting_change_field":
-        t = msg_norm
-        if "service" in t:
-            session["state"] = "awaiting_service"
-            reply = "Sure — what service would you like?\n\n" + welcome_menu()
-        elif "time" in t or "date" in t:
-            session["state"] = "awaiting_time"
-            reply = (
-                "Sure — what day & time would you like?\n"
-                "Examples:\n• tomorrow 3pm\n• friday at 1\n• 6 jan 16:00"
-            )
-        elif "name" in t:
-            session["state"] = "awaiting_name"
-            reply = "Sure — what’s your name?"
-        else:
-            reply = "Type: service / time / name"
-
-    else:
-        # Failsafe: never crash / never loop weirdly
-        reset_session(phone)
-        reply = "✅ Let’s start again.\n\n" + welcome_menu()
-
-    resp = MessagingResponse()
-    resp.message(reply)
+    # Fallback
+    msg.body(menu_text())
     return str(resp)
 
 
 if __name__ == "__main__":
+    # Start reminders in-process (works as long as this script stays running)
+    if ENABLE_REMINDERS and can_send_outbound():
+        threading.Thread(target=reminder_loop, daemon=True).start()
+        print("✅ Reminder loop ON (1h + 30m)")
+    else:
+        print("⚠️ Reminder loop OFF (missing Twilio REST creds or disabled)")
+
     app.run(host="0.0.0.0", port=PORT, debug=True)

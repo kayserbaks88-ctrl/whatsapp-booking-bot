@@ -11,7 +11,7 @@ load_dotenv()
 
 app = Flask(__name__)
 
-SHOP_NAME = os.getenv("BARBERSHOP_NAME", "BBC Barbers")
+SHOP_NAME = os.getenv("BARBERSHOP_NAME", "TrimTech AI")
 PORT = int(os.getenv("PORT", "5000"))
 TZ_NAME = os.getenv("TIMEZONE", "Europe/London")
 TZ = ZoneInfo(TZ_NAME)
