@@ -94,9 +94,10 @@ def parse_dt(text):
 def menu():
     txt = ["💈 BBC Barbers", "Reply with number or name:\n"]
     for i, (n, p, m) in enumerate(SERVICES, 1):
-        txt.append(f"{i}) {n} — £{p} ({m} mins)")
+        txt.append(f"{i}) {n} — £{p}")
     txt.append("\nHours: Mon–Sat 9am–6pm | Sun Closed")
     return "\n".join(txt)
+
 
 # ---------------- WEBHOOK ----------------
 
