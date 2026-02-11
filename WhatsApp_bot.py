@@ -10,7 +10,12 @@ from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
 
-from calendar_helper import create_booking_event, delete_booking_event
+from calendar_helper import (
+    create_booking_event,
+    delete_booking_event,
+    is_time_available,
+    next_available_slots,
+)
 
 load_dotenv()
 
@@ -98,15 +103,6 @@ SERVICE_ALIASES = {
 user_state = {}
 
 # phone -> active booking info (used for reminders & cancel)
-# {
-#   "service": str,
-#   "dt": iso str,
-#   "name": str,
-#   "event_id": str,
-#   "link": str,
-#   "rem1_sent": bool,
-#   "rem2_sent": bool
-# }
 active_bookings = {}
 
 
@@ -179,26 +175,17 @@ def parse_datetime(text: str) -> datetime | None:
     return dt.astimezone(TZ)
 
 def service_from_text(text: str) -> str | None:
-    """
-    Fix for 'kids cut' being detected as 'cut' (Haircut):
-    - numeric selection first
-    - exact match second
-    - alias match third (longest keys first)
-    """
     t = norm(text)
 
-    # 1) Numeric selection
     if t.isdigit():
         i = int(t) - 1
         if 0 <= i < len(SERVICES):
             return SERVICES[i]
 
-    # 2) Exact match to service names
     for s in SERVICES:
         if norm(s) == t:
             return s
 
-    # 3) Alias match (longest first)
     for k in sorted(SERVICE_ALIASES.keys(), key=len, reverse=True):
         if k in t:
             return SERVICE_ALIASES[k]
@@ -209,23 +196,12 @@ def fmt_dt(dt: datetime) -> str:
     return dt.astimezone(TZ).strftime("%a %d %b, %I:%M %p").lstrip("0").replace(" 0", " ")
 
 def menu_text() -> str:
-    lines = [
-        brand_header(),
-        "",
-        "Choose a service:",
-    ]
+    lines = [brand_header(), "", "Choose a service:"]
     for i, s in enumerate(SERVICES, start=1):
         price = SERVICE_PRICES.get(s, "")
-        if price:
-            lines.append(f"{i}) {s} — {price}")
-        else:
-            lines.append(f"{i}) {s}")
+        lines.append(f"{i}) {s} — {price}" if price else f"{i}) {s}")
 
-    lines += [
-        "",
-        "Reply with a number or service name.",
-        pretty_hours_one_line(),
-    ]
+    lines += ["", "Reply with a number or service name.", pretty_hours_one_line()]
     return "\n".join(lines)
 
 def confirm_text(st) -> str:
@@ -251,16 +227,11 @@ def can_send_outbound() -> bool:
     return bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM and TwilioClient)
 
 def send_whatsapp(to_phone: str, body: str) -> bool:
-    """Sends outbound WhatsApp message (for reminders)."""
     if not can_send_outbound():
         return False
     try:
         client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        client.messages.create(
-            from_=TWILIO_WHATSAPP_FROM,
-            to=to_phone,
-            body=body,
-        )
+        client.messages.create(from_=TWILIO_WHATSAPP_FROM, to=to_phone, body=body)
         return True
     except Exception:
         return False
@@ -279,7 +250,6 @@ def reminder_loop():
                 except Exception:
                     continue
 
-                # If booking already passed, cleanup
                 if dt < now - timedelta(minutes=5):
                     active_bookings.pop(phone, None)
                     continue
@@ -289,7 +259,6 @@ def reminder_loop():
                 price = SERVICE_PRICES.get(service, "")
                 service_line = f"{service}" + (f" — {price}" if price else "")
 
-                # 1 hour reminder
                 if (not b.get("rem1_sent")) and (REMINDER_1 - 1 <= mins_to <= REMINDER_1 + 1):
                     msg = (
                         "⏰ Reminder — BBC Barbers\n\n"
@@ -302,7 +271,6 @@ def reminder_loop():
                     if send_whatsapp(phone, msg):
                         b["rem1_sent"] = True
 
-                # 30 min reminder
                 if (not b.get("rem2_sent")) and (REMINDER_2 - 1 <= mins_to <= REMINDER_2 + 1):
                     msg = (
                         "⏰ See you soon — BBC Barbers\n\n"
@@ -351,7 +319,6 @@ def whatsapp_webhook():
     if t == "view":
         b = active_bookings.get(phone)
         if b and b.get("link"):
-            # WhatsApp may still preview URLs sometimes, but this keeps it clean.
             msg.body(f"Your booking link:\n👉 {b['link']}\n\nReply MENU to return.")
         else:
             msg.body("No booking link saved yet. Book first, then reply VIEW.")
@@ -445,6 +412,48 @@ def whatsapp_webhook():
             )
             return str(resp)
 
+        # ✅ ANTI DOUBLE-BOOKING (check calendar conflicts here)
+        service_name = st.get("service")
+        duration = SERVICE_DURATIONS.get(service_name, DEFAULT_SERVICE_MINUTES)
+
+        available, reason = is_time_available(
+            when=dt,
+            calendar_id=CALENDAR_ID,
+            duration_minutes=duration,
+            timezone=TIMEZONE,
+        )
+
+        if not available:
+            alts = next_available_slots(
+                after_when=dt + timedelta(minutes=SLOT_STEP_MINUTES),
+                calendar_id=CALENDAR_ID,
+                duration_minutes=duration,
+                timezone=TIMEZONE,
+                opening_hour=9,
+                closing_hour=18,
+                slot_step_minutes=SLOT_STEP_MINUTES,
+                days_ahead=7,
+                max_suggestions=3,
+            )
+
+            if alts:
+                st["suggestions"] = [x.isoformat() for x in alts]
+                msg.body(
+                    "❌ That time is already booked.\n\n"
+                    "Next available:\n"
+                    f"1) {fmt_dt(alts[0])}\n"
+                    f"2) {fmt_dt(alts[1]) if len(alts) > 1 else ''}\n"
+                    f"3) {fmt_dt(alts[2]) if len(alts) > 2 else ''}\n\n"
+                    "Reply 1, 2, 3 — or send another day & time."
+                )
+            else:
+                msg.body(
+                    "❌ That time is already booked.\n\n"
+                    "Reply with another day & time."
+                )
+            return str(resp)
+
+        # If free → proceed
         st["dt"] = dt
         st["suggestions"] = None
         st["step"] = "ASK_NAME"
@@ -484,6 +493,42 @@ def whatsapp_webhook():
             name = st.get("name") or "Customer"
             duration = SERVICE_DURATIONS.get(service_name, DEFAULT_SERVICE_MINUTES)
 
+            # ✅ Double-check availability again (prevents race condition)
+            available, reason = is_time_available(
+                when=when,
+                calendar_id=CALENDAR_ID,
+                duration_minutes=duration,
+                timezone=TIMEZONE,
+            )
+            if not available:
+                alts = next_available_slots(
+                    after_when=when + timedelta(minutes=SLOT_STEP_MINUTES),
+                    calendar_id=CALENDAR_ID,
+                    duration_minutes=duration,
+                    timezone=TIMEZONE,
+                    opening_hour=9,
+                    closing_hour=18,
+                    slot_step_minutes=SLOT_STEP_MINUTES,
+                    days_ahead=7,
+                    max_suggestions=3,
+                )
+                st["step"] = "ASK_DATETIME"
+                st["dt"] = None
+                st["suggestions"] = [x.isoformat() for x in alts] if alts else None
+
+                if alts:
+                    msg.body(
+                        "❌ Sorry — that slot was just taken.\n\n"
+                        "Next available:\n"
+                        f"1) {fmt_dt(alts[0])}\n"
+                        f"2) {fmt_dt(alts[1]) if len(alts) > 1 else ''}\n"
+                        f"3) {fmt_dt(alts[2]) if len(alts) > 2 else ''}\n\n"
+                        "Reply 1, 2, 3 — or send another day & time."
+                    )
+                else:
+                    msg.body("❌ Sorry — that slot was just taken.\n\nReply with another day & time.")
+                return str(resp)
+
             ok, message, link, event_id = create_booking_event(
                 service_name=service_name,
                 when=when,
@@ -520,20 +565,17 @@ def whatsapp_webhook():
                     "Powered by TrimTech AI"
                 )
             else:
-                msg.body(f"Booking failed: {message}\n\nReply MENU to try again.")
+                msg.body(f"{message}\n\nReply MENU to try again.")
             return str(resp)
 
-        # Anything else -> re-show confirm
         msg.body(confirm_text(st))
         return str(resp)
 
-    # Fallback
     msg.body(menu_text())
     return str(resp)
 
 
 if __name__ == "__main__":
-    # Start reminders in-process (works as long as this script stays running)
     if ENABLE_REMINDERS and can_send_outbound():
         threading.Thread(target=reminder_loop, daemon=True).start()
         print("✅ Reminder loop ON (1h + 30m)")

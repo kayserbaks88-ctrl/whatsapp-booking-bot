@@ -1,89 +1,112 @@
 import os
-import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 
+# ----------------------------
+# Config
+# ----------------------------
+TIMEZONE = os.getenv("TIMEZONE_HINT", "Europe/London")
+TZ = ZoneInfo(TIMEZONE)
+
+CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+MAX_BARBERS = int(os.getenv("MAX_BARBERS", "1"))
+
+DEFAULT_SERVICE_MINUTES = int(os.getenv("DEFAULT_SERVICE_MINUTES", "45"))
+SLOT_STEP_MINUTES = int(os.getenv("SLOT_STEP_MINUTES", "15"))
+
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-
-def _get_service():
-    """
-    Production-safe:
-    - If GOOGLE_CREDENTIALS_JSON is set (Render), use it.
-    - Otherwise fall back to local file credentials.json for dev.
-    """
-    raw = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
-
-    if raw:
-        # Sometimes people paste with surrounding quotes in Render.
-        # This will safely handle: '"{...}"'
-        if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
-            raw = raw[1:-1]
-
-        info = json.loads(raw)
-        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    else:
-        sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "credentials.json")
-        creds = Credentials.from_service_account_file(sa_file, scopes=SCOPES)
-
-    return build("calendar", "v3", credentials=creds)
+creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+service = build("calendar", "v3", credentials=creds)
 
 
-def create_booking_event(
-    service_name: str,
-    when: datetime,
-    name: str = "Customer",
-    phone: str = "",
-    calendar_id: str = "primary",
-    duration_minutes: int = 45,
-    timezone: str = "Europe/London",
+def _to_tz(dt: datetime) -> datetime:
+    """Ensure dt is timezone-aware and in shop TZ."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=TZ)
+    return dt.astimezone(TZ)
+
+
+def _count_overlapping_events(start: datetime, end: datetime) -> int:
+    """Counts events that overlap [start, end)."""
+    start = _to_tz(start)
+    end = _to_tz(end)
+
+    resp = service.events().list(
+        calendarId=CALENDAR_ID,
+        timeMin=start.isoformat(),
+        timeMax=end.isoformat(),
+        singleEvents=True,
+        orderBy="startTime",
+        maxResults=50,
+    ).execute()
+
+    return len(resp.get("items", []))
+
+
+# ----------------------------
+# Public helpers used by bot
+# ----------------------------
+def is_time_available(when: datetime, duration_mins: int = DEFAULT_SERVICE_MINUTES) -> bool:
+    """Returns True if slot has remaining capacity (< MAX_BARBERS)."""
+    when = _to_tz(when)
+    end = when + timedelta(minutes=duration_mins)
+
+    existing = _count_overlapping_events(when, end)
+    return existing < MAX_BARBERS
+
+
+def next_available_slots(
+    start_from: datetime,
+    duration_mins: int = DEFAULT_SERVICE_MINUTES,
+    count: int = 4,
+    window_hours: int = 8,
 ):
     """
-    Returns: (ok: bool, message: str, link: str|None, event_id: str|None)
+    Returns a list of the next available slot datetimes.
+    Searches forward in SLOT_STEP_MINUTES increments for up to window_hours.
     """
-    try:
-        tz = ZoneInfo(timezone)
+    start_from = _to_tz(start_from)
 
-        # Normalize time to correct timezone
-        if when.tzinfo is None:
-            start_dt = when.replace(tzinfo=tz)
-        else:
-            start_dt = when.astimezone(tz)
+    slots = []
+    cursor = start_from
+    end_search = start_from + timedelta(hours=window_hours)
 
-        end_dt = start_dt + timedelta(minutes=int(duration_minutes))
+    while cursor <= end_search and len(slots) < count:
+        if is_time_available(cursor, duration_mins):
+            slots.append(cursor)
+        cursor += timedelta(minutes=SLOT_STEP_MINUTES)
 
-        summary = f"{service_name} - {name}"
-        description = f"Customer: {name}\nPhone: {phone}\nService: {service_name}"
-
-        event = {
-            "summary": summary,
-            "description": description,
-            "start": {"dateTime": start_dt.isoformat(), "timeZone": timezone},
-            "end": {"dateTime": end_dt.isoformat(), "timeZone": timezone},
-        }
-
-        service = _get_service()
-        created = service.events().insert(calendarId=calendar_id, body=event).execute()
-
-        link = created.get("htmlLink")
-        event_id = created.get("id")
-        return True, "Booked", link, event_id
-
-    except Exception as e:
-        # Make the error easier to read in WhatsApp
-        return False, f"Booking failed: {e}", None, None
+    return slots
 
 
-def delete_booking_event(calendar_id: str, event_id: str):
+def create_booking_event(service_name: str, when: datetime, name="Customer", phone=""):
     """
-    Returns: (ok: bool, message: str)
+    Creates booking ONLY if available.
+    Returns: (ok: bool, msg: str, link: str|None)
     """
-    try:
-        service = _get_service()
-        service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
-        return True, "Deleted"
-    except Exception as e:
-        return False, f"Delete failed: {e}"
+    when = _to_tz(when)
+
+    if not is_time_available(when, DEFAULT_SERVICE_MINUTES):
+        return False, "❌ Sorry, that time is already fully booked.", None
+
+    end = when + timedelta(minutes=DEFAULT_SERVICE_MINUTES)
+
+    event = {
+        "summary": f"{service_name} - {name}",
+        "description": f"Phone: {phone}",
+        "start": {"dateTime": when.isoformat(), "timeZone": TIMEZONE},
+        "end": {"dateTime": end.isoformat(), "timeZone": TIMEZONE},
+    }
+
+    created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+    return True, "✅ Booking confirmed!", created.get("htmlLink")
+
+
+def delete_booking_event(event_id: str):
+    """Optional: delete an event by ID (only needed if your bot supports cancellations)."""
+    service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
+    return True
