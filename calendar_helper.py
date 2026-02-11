@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -9,8 +10,25 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 
 def _get_service():
-    sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "credentials.json")
-    creds = Credentials.from_service_account_file(sa_file, scopes=SCOPES)
+    """
+    Production-safe:
+    - If GOOGLE_CREDENTIALS_JSON is set (Render), use it.
+    - Otherwise fall back to local file credentials.json for dev.
+    """
+    raw = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+
+    if raw:
+        # Sometimes people paste with surrounding quotes in Render.
+        # This will safely handle: '"{...}"'
+        if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+            raw = raw[1:-1]
+
+        info = json.loads(raw)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    else:
+        sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "credentials.json")
+        creds = Credentials.from_service_account_file(sa_file, scopes=SCOPES)
+
     return build("calendar", "v3", credentials=creds)
 
 
@@ -29,12 +47,12 @@ def create_booking_event(
     try:
         tz = ZoneInfo(timezone)
 
+        # Normalize time to correct timezone
         if when.tzinfo is None:
-            when = when.replace(tzinfo=tz)
+            start_dt = when.replace(tzinfo=tz)
         else:
-            when = when.astimezone(tz)
+            start_dt = when.astimezone(tz)
 
-        start_dt = when
         end_dt = start_dt + timedelta(minutes=int(duration_minutes))
 
         summary = f"{service_name} - {name}"
@@ -55,7 +73,8 @@ def create_booking_event(
         return True, "Booked", link, event_id
 
     except Exception as e:
-        return False, str(e), None, None
+        # Make the error easier to read in WhatsApp
+        return False, f"Booking failed: {e}", None, None
 
 
 def delete_booking_event(calendar_id: str, event_id: str):
@@ -67,4 +86,4 @@ def delete_booking_event(calendar_id: str, event_id: str):
         service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
         return True, "Deleted"
     except Exception as e:
-        return False, str(e)
+        return False, f"Delete failed: {e}"
