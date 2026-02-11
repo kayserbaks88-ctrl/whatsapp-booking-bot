@@ -1,112 +1,165 @@
 import os
+import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from typing import List, Tuple, Dict
 
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 
-# ----------------------------
-# Config
-# ----------------------------
-TIMEZONE = os.getenv("TIMEZONE_HINT", "Europe/London")
-TZ = ZoneInfo(TIMEZONE)
-
-CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
-MAX_BARBERS = int(os.getenv("MAX_BARBERS", "1"))
-
-DEFAULT_SERVICE_MINUTES = int(os.getenv("DEFAULT_SERVICE_MINUTES", "45"))
-SLOT_STEP_MINUTES = int(os.getenv("SLOT_STEP_MINUTES", "15"))
-
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
-service = build("calendar", "v3", credentials=creds)
+
+def get_service():
+    raw = os.getenv("GOOGLE_CREDENTIALS_JSON")
+
+    if not raw:
+        raise RuntimeError("GOOGLE_CREDENTIALS_JSON not set in Render env")
+
+    try:
+        creds_info = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError("GOOGLE_CREDENTIALS_JSON is not valid JSON: " + str(e))
+
+    creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
-def _to_tz(dt: datetime) -> datetime:
-    """Ensure dt is timezone-aware and in shop TZ."""
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=TZ)
-    return dt.astimezone(TZ)
+# ---------- AVAILABILITY CHECK (FREEBUSY) ----------
+
+def get_busy(calendar_id: str, start: datetime, end: datetime):
+    service = get_service()
+
+    body = {
+        "timeMin": start.isoformat(),
+        "timeMax": end.isoformat(),
+        "items": [{"id": calendar_id}],
+    }
+
+    result = service.freebusy().query(body=body).execute()
+
+    busy = result["calendars"][calendar_id]["busy"]
+
+    intervals = []
+    for b in busy:
+        s = datetime.fromisoformat(b["start"].replace("Z", "+00:00"))
+        e = datetime.fromisoformat(b["end"].replace("Z", "+00:00"))
+        intervals.append((s, e))
+
+    return intervals
 
 
-def _count_overlapping_events(start: datetime, end: datetime) -> int:
-    """Counts events that overlap [start, end)."""
-    start = _to_tz(start)
-    end = _to_tz(end)
-
-    resp = service.events().list(
-        calendarId=CALENDAR_ID,
-        timeMin=start.isoformat(),
-        timeMax=end.isoformat(),
-        singleEvents=True,
-        orderBy="startTime",
-        maxResults=50,
-    ).execute()
-
-    return len(resp.get("items", []))
+def overlaps(a_start, a_end, b_start, b_end):
+    return a_start < b_end and a_end > b_start
 
 
-# ----------------------------
-# Public helpers used by bot
-# ----------------------------
-def is_time_available(when: datetime, duration_mins: int = DEFAULT_SERVICE_MINUTES) -> bool:
-    """Returns True if slot has remaining capacity (< MAX_BARBERS)."""
-    when = _to_tz(when)
-    end = when + timedelta(minutes=duration_mins)
+def is_time_available(
+    when: datetime,
+    calendar_id: str,
+    duration_minutes: int,
+    timezone: str,
+):
+    tz = ZoneInfo(timezone)
 
-    existing = _count_overlapping_events(when, end)
-    return existing < MAX_BARBERS
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=tz)
+    else:
+        when = when.astimezone(tz)
+
+    end = when + timedelta(minutes=duration_minutes)
+
+    busy = get_busy(
+        calendar_id,
+        when - timedelta(hours=6),
+        end + timedelta(hours=6),
+    )
+
+    for b_start, b_end in busy:
+        b_start = b_start.astimezone(tz)
+        b_end = b_end.astimezone(tz)
+
+        if overlaps(when, end, b_start, b_end):
+            return False, f"Clashes with {b_start.strftime('%H:%M')}–{b_end.strftime('%H:%M')}"
+
+    return True, "OK"
 
 
 def next_available_slots(
-    start_from: datetime,
-    duration_mins: int = DEFAULT_SERVICE_MINUTES,
-    count: int = 4,
-    window_hours: int = 8,
+    after_when: datetime,
+    calendar_id: str,
+    duration_minutes: int,
+    timezone: str,
+    step_minutes: int = 15,
+    limit: int = 5,
 ):
-    """
-    Returns a list of the next available slot datetimes.
-    Searches forward in SLOT_STEP_MINUTES increments for up to window_hours.
-    """
-    start_from = _to_tz(start_from)
+    tz = ZoneInfo(timezone)
 
-    slots = []
-    cursor = start_from
-    end_search = start_from + timedelta(hours=window_hours)
+    cursor = after_when.astimezone(tz)
 
-    while cursor <= end_search and len(slots) < count:
-        if is_time_available(cursor, duration_mins):
-            slots.append(cursor)
-        cursor += timedelta(minutes=SLOT_STEP_MINUTES)
+    found = []
+    attempts = 0
 
-    return slots
+    while len(found) < limit and attempts < 200:
+        ok, _ = is_time_available(cursor, calendar_id, duration_minutes, timezone)
+
+        if ok:
+            found.append(cursor)
+
+        cursor += timedelta(minutes=step_minutes)
+        attempts += 1
+
+    return found
 
 
-def create_booking_event(service_name: str, when: datetime, name="Customer", phone=""):
-    """
-    Creates booking ONLY if available.
-    Returns: (ok: bool, msg: str, link: str|None)
-    """
-    when = _to_tz(when)
+# ---------- EVENT CREATION ----------
 
-    if not is_time_available(when, DEFAULT_SERVICE_MINUTES):
-        return False, "❌ Sorry, that time is already fully booked.", None
+def create_booking_event(
+    calendar_id: str,
+    service_name: str,
+    customer_name: str,
+    start_dt: datetime,
+    duration_minutes: int,
+    phone: str,
+    timezone: str,
+):
+    tz = ZoneInfo(timezone)
 
-    end = when + timedelta(minutes=DEFAULT_SERVICE_MINUTES)
+    start_dt = start_dt.astimezone(tz)
+    end_dt = start_dt + timedelta(minutes=duration_minutes)
 
-    event = {
-        "summary": f"{service_name} - {name}",
-        "description": f"Phone: {phone}",
-        "start": {"dateTime": when.isoformat(), "timeZone": TIMEZONE},
-        "end": {"dateTime": end.isoformat(), "timeZone": TIMEZONE},
+    body = {
+        "summary": f"{service_name} — {customer_name}",
+        "description": f"Customer: {customer_name}\nPhone: {phone}",
+        "start": {
+            "dateTime": start_dt.isoformat(),
+            "timeZone": timezone,
+        },
+        "end": {
+            "dateTime": end_dt.isoformat(),
+            "timeZone": timezone,
+        },
     }
 
-    created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-    return True, "✅ Booking confirmed!", created.get("htmlLink")
+    service = get_service()
+
+    event = service.events().insert(
+        calendarId=calendar_id,
+        body=body
+    ).execute()
+
+    return {
+        "event_id": event.get("id"),
+        "html_link": event.get("htmlLink"),
+    }
 
 
-def delete_booking_event(event_id: str):
-    """Optional: delete an event by ID (only needed if your bot supports cancellations)."""
-    service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
+def delete_booking_event(calendar_id: str, event_id: str):
+    service = get_service()
+
+    service.events().delete(
+        calendarId=calendar_id,
+        eventId=event_id
+    ).execute()
+
     return True
