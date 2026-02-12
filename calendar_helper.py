@@ -1,6 +1,6 @@
 import os
 import json
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from googleapiclient.discovery import build
@@ -8,9 +8,6 @@ from google.oauth2.service_account import Credentials
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-# ----------------------------
-# Google Calendar service
-# ----------------------------
 
 def get_service():
     raw = os.getenv("GOOGLE_CREDENTIALS_JSON")
@@ -26,56 +23,17 @@ def get_service():
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
+# ---------- HELPERS ----------
 
 def overlaps(a_start, a_end, b_start, b_end):
-    # True if time ranges overlap at all
     return a_start < b_end and a_end > b_start
 
 
-def ceil_to_step(dt: datetime, step_minutes: int) -> datetime:
-    # Round up to next step boundary (e.g. 15 mins)
-    dt = dt.replace(second=0, microsecond=0)
-    mod = dt.minute % step_minutes
-    if mod == 0:
-        return dt
-    return dt + timedelta(minutes=(step_minutes - mod))
+def _to_tz(dt: datetime, tz: ZoneInfo) -> datetime:
+    return dt.astimezone(tz) if dt.tzinfo else dt.replace(tzinfo=tz)
 
 
-def within_hours(
-    dt: datetime,
-    tz: ZoneInfo,
-    open_days={"mon", "tue", "wed", "thu", "fri", "sat"},
-    open_time=dtime(9, 0),
-    close_time=dtime(18, 0),
-) -> bool:
-    local = dt.astimezone(tz)
-    day = local.strftime("%a").lower()[:3]
-    if day not in open_days:
-        return False
-    return open_time <= local.time() < close_time
-
-
-def end_within_hours(
-    start_dt: datetime,
-    end_dt: datetime,
-    tz: ZoneInfo,
-    open_time=dtime(9, 0),
-    close_time=dtime(18, 0),
-) -> bool:
-    # Ensure the full service fits before closing time (same day)
-    s = start_dt.astimezone(tz)
-    e = end_dt.astimezone(tz)
-    if s.date() != e.date():
-        return False
-    return (open_time <= s.time()) and (e.time() <= close_time)
-
-
-# ----------------------------
-# Busy times (FreeBusy)
-# ----------------------------
+# ---------- AVAILABILITY (FREEBUSY) ----------
 
 def get_busy_times(calendar_id: str, start: datetime, end: datetime, timezone: str):
     """
@@ -85,8 +43,8 @@ def get_busy_times(calendar_id: str, start: datetime, end: datetime, timezone: s
     service = get_service()
     tz = ZoneInfo(timezone)
 
-    start = start.astimezone(tz) if start.tzinfo else start.replace(tzinfo=tz)
-    end = end.astimezone(tz) if end.tzinfo else end.replace(tzinfo=tz)
+    start = _to_tz(start, tz)
+    end = _to_tz(end, tz)
 
     body = {
         "timeMin": start.isoformat(),
@@ -106,28 +64,36 @@ def get_busy_times(calendar_id: str, start: datetime, end: datetime, timezone: s
     return intervals
 
 
-# ----------------------------
-# Availability API (used by WhatsApp_bot.py)
-# ----------------------------
-
 def is_time_available(
     start_dt: datetime,
     calendar_id: str,
     duration_minutes: int,
     timezone: str,
+    buffer_minutes: int = 0,
+    ignore_interval: tuple[datetime, datetime] | None = None,
 ):
+    """
+    Checks if [start_dt, start_dt+duration+buffer] overlaps any busy time.
+    ignore_interval: (old_start, old_end) to ignore clashes with the booking being rescheduled.
+    """
     tz = ZoneInfo(timezone)
+    start_dt = _to_tz(start_dt, tz)
 
-    start_dt = start_dt.astimezone(tz) if start_dt.tzinfo else start_dt.replace(tzinfo=tz)
-    end_dt = start_dt + timedelta(minutes=duration_minutes)
-
-    # Full service must be within shop hours
-    if not within_hours(start_dt, tz) or not end_within_hours(start_dt, end_dt, tz):
-        return False, "Outside opening hours"
+    # buffer extends the blocked end time (cleanup time)
+    end_dt = start_dt + timedelta(minutes=duration_minutes + max(0, buffer_minutes))
 
     busy = get_busy_times(calendar_id, start_dt, end_dt, timezone)
 
+    ign_s = ign_e = None
+    if ignore_interval:
+        ign_s = _to_tz(ignore_interval[0], tz)
+        ign_e = _to_tz(ignore_interval[1], tz)
+
     for bs, be in busy:
+        # ignore the interval being rescheduled (best-effort)
+        if ign_s and ign_e and bs == ign_s and be == ign_e:
+            continue
+
         if overlaps(start_dt, end_dt, bs, be):
             return False, f"Clashes with {bs.strftime('%H:%M')}–{be.strftime('%H:%M')}"
 
@@ -142,62 +108,45 @@ def next_available_slots(
     step_minutes: int = 15,
     max_results: int = 5,
     search_days: int = 7,
+    buffer_minutes: int = 0,
 ):
     """
-    Returns next available start times (datetime list) after from_dt.
-    Only returns slots where the FULL service fits and does not overlap busy times.
+    Finds next available start times after from_dt.
+    Uses duration + buffer for checks (buffer=cleanup time).
+    NOTE: opening hours are enforced in WhatsApp_bot.py; this function only finds non-overlapping slots.
     """
     tz = ZoneInfo(timezone)
-    from_dt = from_dt.astimezone(tz) if from_dt.tzinfo else from_dt.replace(tzinfo=tz)
-    from_dt = ceil_to_step(from_dt, step_minutes)
+    from_dt = _to_tz(from_dt, tz).replace(second=0, microsecond=0)
+
+    # ceil to step
+    mod = from_dt.minute % step_minutes
+    if mod != 0:
+        from_dt = from_dt + timedelta(minutes=(step_minutes - mod))
+        from_dt = from_dt.replace(second=0, microsecond=0)
 
     results = []
     cursor = from_dt
     end_search = from_dt + timedelta(days=search_days)
 
-    open_days = {"mon", "tue", "wed", "thu", "fri", "sat"}
-    open_time = dtime(9, 0)
-    close_time = dtime(18, 0)
+    effective_minutes = duration_minutes + max(0, buffer_minutes)
 
     while cursor < end_search and len(results) < max_results:
-        day = cursor.strftime("%a").lower()[:3]
+        ok, _ = is_time_available(
+            cursor,
+            calendar_id,
+            duration_minutes,
+            timezone,
+            buffer_minutes=buffer_minutes,
+        )
+        if ok:
+            results.append(cursor)
 
-        # Closed day -> jump to next day 9am
-        if day not in open_days:
-            cursor = (cursor + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-            continue
-
-        # Before opening -> jump to opening
-        if cursor.time() < open_time:
-            cursor = cursor.replace(hour=9, minute=0, second=0, microsecond=0)
-
-        # After close -> jump to next day opening
-        if cursor.time() >= close_time:
-            cursor = (cursor + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-            continue
-
-        slot_start = cursor
-        slot_end = slot_start + timedelta(minutes=duration_minutes)
-
-        # Must fully fit before close
-        if not end_within_hours(slot_start, slot_end, tz, open_time=open_time, close_time=close_time):
-            cursor = (cursor + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-            continue
-
-        busy = get_busy_times(calendar_id, slot_start, slot_end, timezone)
-        clash = any(overlaps(slot_start, slot_end, bs, be) for bs, be in busy)
-
-        if not clash:
-            results.append(slot_start)
-
-        cursor = cursor + timedelta(minutes=step_minutes)
+        cursor += timedelta(minutes=step_minutes)
 
     return results
 
 
-# ----------------------------
-# Event creation / deletion
-# ----------------------------
+# ---------- EVENTS ----------
 
 def create_booking_event(
     calendar_id: str,
@@ -209,8 +158,7 @@ def create_booking_event(
     timezone: str,
 ):
     tz = ZoneInfo(timezone)
-
-    start_dt = start_dt.astimezone(tz) if start_dt.tzinfo else start_dt.replace(tzinfo=tz)
+    start_dt = _to_tz(start_dt, tz)
     end_dt = start_dt + timedelta(minutes=duration_minutes)
 
     body = {
@@ -230,3 +178,72 @@ def delete_booking_event(calendar_id: str, event_id: str):
     service = get_service()
     service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
     return True
+
+
+def read_event(calendar_id: str, event_id: str):
+    service = get_service()
+    return service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+
+
+def update_booking_event_time(
+    calendar_id: str,
+    event_id: str,
+    new_start: datetime,
+    duration_minutes: int,
+    timezone: str,
+):
+    tz = ZoneInfo(timezone)
+    new_start = _to_tz(new_start, tz)
+    new_end = new_start + timedelta(minutes=duration_minutes)
+
+    body = {
+        "start": {"dateTime": new_start.isoformat(), "timeZone": timezone},
+        "end": {"dateTime": new_end.isoformat(), "timeZone": timezone},
+    }
+
+    service = get_service()
+    event = service.events().patch(calendarId=calendar_id, eventId=event_id, body=body).execute()
+
+    return {"event_id": event.get("id"), "html_link": event.get("htmlLink")}
+
+
+def find_next_booking_by_phone(calendar_id: str, phone: str, timezone: str, days_ahead: int = 60):
+    """
+    Best-effort lookup: searches upcoming events containing the phone in description.
+    Returns (event_id, start_dt, end_dt, summary, htmlLink) or None
+    """
+    tz = ZoneInfo(timezone)
+    now = datetime.now(tz)
+    time_max = now + timedelta(days=days_ahead)
+
+    service = get_service()
+    resp = service.events().list(
+        calendarId=calendar_id,
+        timeMin=now.isoformat(),
+        timeMax=time_max.isoformat(),
+        singleEvents=True,
+        orderBy="startTime",
+        q=phone,
+        maxResults=10,
+    ).execute()
+
+    items = resp.get("items", [])
+    if not items:
+        return None
+
+    e = items[0]
+    start_raw = e.get("start", {}).get("dateTime")
+    end_raw = e.get("end", {}).get("dateTime")
+    if not start_raw or not end_raw:
+        return None
+
+    start_dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).astimezone(tz)
+    end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).astimezone(tz)
+
+    return {
+        "event_id": e.get("id"),
+        "start_dt": start_dt,
+        "end_dt": end_dt,
+        "summary": e.get("summary", ""),
+        "html_link": e.get("htmlLink"),
+    }
