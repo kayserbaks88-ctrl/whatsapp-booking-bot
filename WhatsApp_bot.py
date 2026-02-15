@@ -526,6 +526,27 @@ def whatsapp():
             msg.body("Session reset. Reply MENU.")
             return str(resp)
 
+    # First try normal parsing
+    dt = parse_dt(body)
+
+    # If normal parsing fails, try LLM extraction
+    if not dt and OPENAI_API_KEY:
+        data = call_openai_json(body)
+        if data:
+            datetime_text = data.get("datetime_text")
+            if datetime_text:
+                dt = parse_dt(datetime_text)
+
+    # If still no datetime, show error
+    if not dt:
+        msg.body(
+            "I didn’t understand the time.\n"
+            "Try: Tomorrow 2pm / Mon 3:15pm / 10/02 15:30\n\n"
+            "Reply BACK to change service."
+        )
+        return str(resp)
+
+
         dt = parse_dt(body)
         if not dt:
             msg.body("I didn’t understand the time.\nTry: Tomorrow 2pm / Mon 3:15pm / 10/02 15:30\n\nReply BACK to change service.")
