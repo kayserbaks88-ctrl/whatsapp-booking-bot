@@ -89,15 +89,24 @@ def end_within_hours(start_dt, minutes):
     return end_dt.time() <= CLOSE_TIME and start_dt.date() == end_dt.date()
 
 def parse_dt(text):
-    """
-    Robust datetime parser for common WhatsApp inputs:
-    - "Monday 2pm", "Mon 2pm"
-    - "2pm Monday", "2pm Mon"
-    - "14:00 Monday"
-    - "10/02 15:30", "Sat 7 Feb 1pm", "tomorrow 2pm"
-    """
     if not text:
         return None
+
+    settings = {
+        "TIMEZONE": TIMEZONE,
+        "RETURN_AS_TIMEZONE_AWARE": True,
+        "PREFER_DATES_FROM": "future",
+        "RELATIVE_BASE": now(),
+        "DATE_ORDER": "DMY",
+    }
+
+    dt = dateparser.parse(text.strip(), settings=settings)
+
+    if not dt:
+        return None
+
+    return dt.astimezone(TZ)
+
 
     t = re.sub(r"\s+", " ", text.strip().lower())
 
