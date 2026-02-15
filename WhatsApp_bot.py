@@ -1,5 +1,7 @@
 import os
 import re
+import json
+import requests
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
@@ -64,6 +66,13 @@ ALIASES = {
     "shape up": "Shape Up",
 }
 
+# ---- OpenAI (LLM fallback) ----
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# Set this in Render if you want. Otherwise leave default.
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+# If you ever want to disable AI quickly:
+LLM_FALLBACK_ENABLED = os.getenv("LLM_FALLBACK_ENABLED", "1") == "1"
+
 user_state = {}
 app = Flask(__name__)
 
@@ -88,7 +97,82 @@ def end_within_hours(start_dt, minutes):
     end_dt = start_dt + timedelta(minutes=minutes)
     return end_dt.time() <= CLOSE_TIME and start_dt.date() == end_dt.date()
 
+def _llm_parse_datetime(text: str):
+    """
+    LLM fallback: returns timezone-aware datetime in TZ, or None.
+    Only called when dateparser fails.
+    """
+    if not (LLM_FALLBACK_ENABLED and OPENAI_API_KEY and text):
+        return None
+
+    # Keep prompt tight & deterministic: ask for strict JSON only
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {
+                "role": "system",
+                "content": (
+                    "You convert short WhatsApp booking time text into a single ISO 8601 datetime.\n"
+                    f"Timezone: {TIMEZONE}.\n"
+                    "Prefer future dates.\n"
+                    "UK date order is DMY when ambiguous.\n"
+                    "If the user provides only a time (e.g., '2pm'), assume the next valid day.\n"
+                    "Return ONLY JSON in one of these forms:\n"
+                    '{"iso": "YYYY-MM-DDTHH:MM:SS+00:00"}\n'
+                    'or {"iso": null} if you cannot confidently parse.'
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Now: {now().isoformat()}\nText: {text}",
+            },
+        ],
+        # Ask the API to enforce JSON object output
+        "text": {"format": {"type": "json_object"}},
+    }
+
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(payload),
+            timeout=12,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        # Extract text output
+        out_text = ""
+        for item in data.get("output", []):
+            if item.get("type") == "message":
+                for c in item.get("content", []):
+                    if c.get("type") == "output_text":
+                        out_text += c.get("text", "")
+
+        out_text = (out_text or "").strip()
+        if not out_text:
+            return None
+
+        obj = json.loads(out_text)
+        iso = obj.get("iso")
+        if not iso:
+            return None
+
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
+        return dt.astimezone(TZ)
+
+    except Exception:
+        return None
+
 def parse_dt(text):
+    """
+    Deterministic parse first. If it fails, use LLM fallback.
+    """
     if not text:
         return None
 
@@ -101,59 +185,11 @@ def parse_dt(text):
     }
 
     dt = dateparser.parse(text.strip(), settings=settings)
+    if dt:
+        return dt.astimezone(TZ)
 
-    if not dt:
-        return None
-
-    return dt.astimezone(TZ)
-
-
-    t = re.sub(r"\s+", " ", text.strip().lower())
-
-    # normalize punctuation
-    t = t.replace(",", " ")
-
-    # normalize short weekdays
-    weekday_map = {
-        "mon": "monday",
-        "tue": "tuesday",
-        "tues": "tuesday",
-        "wed": "wednesday",
-        "thu": "thursday",
-        "thur": "thursday",
-        "thurs": "thursday",
-        "fri": "friday",
-        "sat": "saturday",
-        "sun": "sunday",
-    }
-    parts = t.split()
-    parts = [weekday_map.get(p, p) for p in parts]
-    t = " ".join(parts)
-
-    # swap "2pm monday" / "14:00 monday" -> "monday 2pm"
-    parts = t.split()
-    if len(parts) == 2:
-        first, second = parts[0], parts[1]
-        looks_like_time = ("am" in first) or ("pm" in first) or (":" in first) or first.isdigit()
-        looks_like_weekday = second in weekday_map.values()
-        if looks_like_time and looks_like_weekday:
-            t = f"{second} {first}"
-
-    settings = {
-        "TIMEZONE": TIMEZONE,
-        "RETURN_AS_TIMEZONE_AWARE": True,
-        "PREFER_DATES_FROM": "future",
-        "RELATIVE_BASE": now(),
-    }
-
-    # Force English to avoid environment/locale weirdness on hosting
-    dt = dateparser.parse(t, settings=settings, languages=["en"])
-
-    if not dt:
-        return None
-
-    return dt.astimezone(TZ)
-
+    # Fallback to LLM if dateparser couldn't parse
+    return _llm_parse_datetime(text)
 
 def menu():
     # price only (no durations shown)
@@ -193,6 +229,11 @@ def whatsapp():
         msg.body(menu())
         return str(resp)
 
+    if t == "reset":
+        user_state[from_] = {"step": "SERVICE"}
+        msg.body("✅ Reset done.\n\n" + menu())
+        return str(resp)
+
     if t == "cancel":
         eid = st.get("event_id")
         if not eid:
@@ -201,9 +242,12 @@ def whatsapp():
             eid = found["event_id"] if found else None
 
         if eid:
-            delete_booking_event(CALENDAR_ID, eid)
-            user_state[from_] = {"step": "SERVICE"}
-            msg.body("✅ Booking cancelled. Reply MENU to book again.")
+            try:
+                delete_booking_event(CALENDAR_ID, eid)
+                user_state[from_] = {"step": "SERVICE"}
+                msg.body("✅ Booking cancelled. Reply MENU to book again.")
+            except Exception:
+                msg.body("⚠️ I couldn’t cancel right now. Please try again in 2 minutes.")
         else:
             msg.body("No confirmed booking found to cancel.")
         return str(resp)
@@ -240,7 +284,12 @@ def whatsapp():
             st["html_link"] = found.get("html_link")
 
         # read event to get exact old interval
-        ev = read_event(CALENDAR_ID, eid)
+        try:
+            ev = read_event(CALENDAR_ID, eid)
+        except Exception:
+            msg.body("⚠️ I couldn’t open your booking right now. Try again in 2 minutes.")
+            return str(resp)
+
         sraw = ev.get("start", {}).get("dateTime")
         eraw = ev.get("end", {}).get("dateTime")
         if not sraw or not eraw:
@@ -302,56 +351,69 @@ def whatsapp():
     # ----- CHOOSE TIME -----
 
     if step == "TIME":
-        service = st.get("service")
-        dt = parse_dt(body)
+        try:
+            service = st.get("service")
+            dt = parse_dt(body)
 
-        if not dt:
-            msg.body("I didn’t understand the time. Try: Tomorrow 2pm")
+            if not dt:
+                msg.body("I didn’t understand the time. Try: Tomorrow 2pm, Mon 2pm, or 10/02 15:30")
+                return str(resp)
+
+            if not within_hours(dt) or not end_within_hours(dt, SERVICE_META[service]["minutes"]):
+                msg.body("⛔ We’re closed then. Mon–Sat 9–6 only.")
+                return str(resp)
+
+            duration = SERVICE_META[service]["minutes"]
+
+            try:
+                ok, reason = is_time_available(
+                    dt, CALENDAR_ID, duration, TIMEZONE,
+                    buffer_minutes=BOOKING_BUFFER_MINUTES
+                )
+            except Exception:
+                msg.body("⚠️ Booking system is temporarily unavailable. Please try again in 2 minutes.\nReply MENU to restart.")
+                return str(resp)
+
+            if not ok:
+                try:
+                    alts = next_available_slots(
+                        dt + timedelta(minutes=SLOT_STEP_MINUTES),
+                        CALENDAR_ID,
+                        duration,
+                        TIMEZONE,
+                        step_minutes=SLOT_STEP_MINUTES,
+                        max_results=5,
+                        search_days=7,
+                        buffer_minutes=BOOKING_BUFFER_MINUTES
+                    )
+                except Exception:
+                    msg.body("❌ Not available. Please try another time or reply MENU.")
+                    return str(resp)
+
+                alts = [x for x in alts if within_hours(x) and end_within_hours(x, duration)]
+
+                if alts:
+                    txt = "\n".join([f"• {fmt(x)}" for x in alts])
+                    msg.body(f"❌ Not available ({reason})\n\nNext:\n{txt}")
+                else:
+                    msg.body("❌ Not available. Try another time.")
+                return str(resp)
+
+            # HOLD
+            user_state[from_] = {
+                "step": "NAME",
+                "service": service,
+                "dt": dt,
+                "hold_until": now() + timedelta(minutes=HOLD_EXPIRE_MINUTES)
+            }
+
+            msg.body(f"✅ Time held: {fmt(dt)}\n\nWhat’s your name?")
             return str(resp)
 
-        if not within_hours(dt) or not end_within_hours(dt, SERVICE_META[service]["minutes"]):
-            msg.body("⛔ We’re closed then. Mon–Sat 9–6 only.")
+        except Exception:
+            user_state[from_] = {"step": "SERVICE"}
+            msg.body("⚠️ Something went wrong. Reply MENU to restart.")
             return str(resp)
-
-        duration = SERVICE_META[service]["minutes"]
-
-        ok, reason = is_time_available(
-            dt, CALENDAR_ID, duration, TIMEZONE,
-            buffer_minutes=BOOKING_BUFFER_MINUTES
-        )
-
-        if not ok:
-            alts = next_available_slots(
-                dt + timedelta(minutes=SLOT_STEP_MINUTES),
-                CALENDAR_ID,
-                duration,
-                TIMEZONE,
-                step_minutes=SLOT_STEP_MINUTES,
-                max_results=5,
-                search_days=7,
-                buffer_minutes=BOOKING_BUFFER_MINUTES
-            )
-
-            # filter alts to opening hours on bot side
-            alts = [x for x in alts if within_hours(x) and end_within_hours(x, duration)]
-
-            if alts:
-                txt = "\n".join([f"• {fmt(x)}" for x in alts])
-                msg.body(f"❌ Not available ({reason})\n\nNext:\n{txt}")
-            else:
-                msg.body("❌ Not available. Try another time.")
-            return str(resp)
-
-        # HOLD
-        user_state[from_] = {
-            "step": "NAME",
-            "service": service,
-            "dt": dt,
-            "hold_until": now() + timedelta(minutes=HOLD_EXPIRE_MINUTES)
-        }
-
-        msg.body(f"✅ Time held: {fmt(dt)}\n\nWhat’s your name?")
-        return str(resp)
 
     # ----- ASK NAME -----
 
@@ -398,24 +460,35 @@ def whatsapp():
         dt = st["dt"]
         duration = SERVICE_META[s]["minutes"]
 
-        ok, reason = is_time_available(
-            dt, CALENDAR_ID, duration, TIMEZONE,
-            buffer_minutes=BOOKING_BUFFER_MINUTES
-        )
+        try:
+            ok, reason = is_time_available(
+                dt, CALENDAR_ID, duration, TIMEZONE,
+                buffer_minutes=BOOKING_BUFFER_MINUTES
+            )
+        except Exception:
+            user_state[from_] = {"step": "TIME", "service": s}
+            msg.body("⚠️ Booking system is temporarily unavailable. Please try again.\nSend a new time:")
+            return str(resp)
+
         if not ok:
             user_state[from_] = {"step": "TIME", "service": s}
             msg.body(f"❌ Just got taken ({reason}). Send new time.")
             return str(resp)
 
-        event = create_booking_event(
-            CALENDAR_ID,
-            s,
-            st["name"],
-            dt,
-            duration,
-            from_,
-            TIMEZONE,
-        )
+        try:
+            event = create_booking_event(
+                CALENDAR_ID,
+                s,
+                st["name"],
+                dt,
+                duration,
+                from_,
+                TIMEZONE,
+            )
+        except Exception:
+            user_state[from_] = {"step": "TIME", "service": s}
+            msg.body("⚠️ I couldn’t confirm that booking right now. Please try again.\nSend a new time:")
+            return str(resp)
 
         st["event_id"] = event["event_id"]
         st["html_link"] = event["html_link"]
@@ -430,7 +503,8 @@ def whatsapp():
             f"📅 {fmt(dt)}\n\n"
             f"Reply RESCHEDULE to change time\n"
             f"Reply CANCEL to cancel\n"
-            f"Reply VIEW for link\n\n"
+            f"Reply VIEW for link\n"
+            f"Reply RESET to restart\n\n"
             f"Powered by {BUSINESS_NAME}"
         )
         return str(resp)
@@ -438,72 +512,92 @@ def whatsapp():
     # ----- RESCHEDULE FLOW -----
 
     if step == "RESCHEDULE_TIME":
-        dt = parse_dt(body)
-        if not dt:
-            msg.body("I didn’t understand the time. Try: Tomorrow 3pm")
-            return str(resp)
+        try:
+            dt = parse_dt(body)
+            if not dt:
+                msg.body("I didn’t understand the time. Try: Tomorrow 3pm, Mon 2pm, or 13/02 15:15")
+                return str(resp)
 
-        service = st["service"]
-        duration = st["duration"]
-        old_start = st["old_start"]
-        old_end = st["old_end"]
-        eid = st["event_id"]
+            service = st["service"]
+            duration = st["duration"]
+            old_start = st["old_start"]
+            old_end = st["old_end"]
+            eid = st["event_id"]
 
-        if not within_hours(dt) or not end_within_hours(dt, duration):
-            msg.body("⛔ We’re closed then. Mon–Sat 9–6 only.")
-            return str(resp)
+            if not within_hours(dt) or not end_within_hours(dt, duration):
+                msg.body("⛔ We’re closed then. Mon–Sat 9–6 only.")
+                return str(resp)
 
-        ok, reason = is_time_available(
-            dt, CALENDAR_ID, duration, TIMEZONE,
-            buffer_minutes=BOOKING_BUFFER_MINUTES,
-            ignore_interval=(old_start, old_end),
-        )
+            try:
+                ok, reason = is_time_available(
+                    dt, CALENDAR_ID, duration, TIMEZONE,
+                    buffer_minutes=BOOKING_BUFFER_MINUTES,
+                    ignore_interval=(old_start, old_end),
+                )
+            except Exception:
+                msg.body("⚠️ Booking system is temporarily unavailable. Please try again in 2 minutes.")
+                return str(resp)
 
-        if not ok:
-            alts = next_available_slots(
-                dt + timedelta(minutes=SLOT_STEP_MINUTES),
-                CALENDAR_ID,
-                duration,
-                TIMEZONE,
-                step_minutes=SLOT_STEP_MINUTES,
-                max_results=5,
-                search_days=7,
-                buffer_minutes=BOOKING_BUFFER_MINUTES
+            if not ok:
+                try:
+                    alts = next_available_slots(
+                        dt + timedelta(minutes=SLOT_STEP_MINUTES),
+                        CALENDAR_ID,
+                        duration,
+                        TIMEZONE,
+                        step_minutes=SLOT_STEP_MINUTES,
+                        max_results=5,
+                        search_days=7,
+                        buffer_minutes=BOOKING_BUFFER_MINUTES
+                    )
+                except Exception:
+                    msg.body("❌ Not available. Try another time or reply MENU.")
+                    return str(resp)
+
+                alts = [x for x in alts if within_hours(x) and end_within_hours(x, duration)]
+                if alts:
+                    txt = "\n".join([f"• {fmt(x)}" for x in alts])
+                    msg.body(f"❌ Not available ({reason})\n\nNext:\n{txt}")
+                else:
+                    msg.body("❌ Not available. Try another time.")
+                return str(resp)
+
+            # update event time
+            try:
+                updated = update_booking_event_time(
+                    CALENDAR_ID,
+                    eid,
+                    dt,
+                    duration,
+                    TIMEZONE,
+                )
+            except Exception:
+                msg.body("⚠️ I couldn’t reschedule right now. Please try again in 2 minutes.")
+                return str(resp)
+
+            st["dt"] = dt
+            st["html_link"] = updated.get("html_link") or st.get("html_link")
+            st["step"] = "DONE"
+            user_state[from_] = st
+
+            p = SERVICE_META.get(service, {"price": ""})["price"]
+
+            msg.body(
+                f"✅ RESCHEDULED!\n\n"
+                f"💈 {service} — £{p}\n"
+                f"📅 {fmt(dt)}\n\n"
+                f"Reply RESCHEDULE to change again\n"
+                f"Reply CANCEL to cancel\n"
+                f"Reply VIEW for link\n"
+                f"Reply RESET to restart\n\n"
+                f"Powered by {BUSINESS_NAME}"
             )
-            alts = [x for x in alts if within_hours(x) and end_within_hours(x, duration)]
-            if alts:
-                txt = "\n".join([f"• {fmt(x)}" for x in alts])
-                msg.body(f"❌ Not available ({reason})\n\nNext:\n{txt}")
-            else:
-                msg.body("❌ Not available. Try another time.")
             return str(resp)
 
-        # update event time
-        updated = update_booking_event_time(
-            CALENDAR_ID,
-            eid,
-            dt,
-            duration,
-            TIMEZONE,
-        )
-
-        st["dt"] = dt
-        st["html_link"] = updated.get("html_link") or st.get("html_link")
-        st["step"] = "DONE"
-        user_state[from_] = st
-
-        p = SERVICE_META.get(service, {"price": ""})["price"]
-
-        msg.body(
-            f"✅ RESCHEDULED!\n\n"
-            f"💈 {service} — £{p}\n"
-            f"📅 {fmt(dt)}\n\n"
-            f"Reply RESCHEDULE to change again\n"
-            f"Reply CANCEL to cancel\n"
-            f"Reply VIEW for link\n\n"
-            f"Powered by {BUSINESS_NAME}"
-        )
-        return str(resp)
+        except Exception:
+            user_state[from_] = {"step": "SERVICE"}
+            msg.body("⚠️ Something went wrong. Reply MENU to restart.")
+            return str(resp)
 
     # fallback
     user_state[from_] = {"step": "SERVICE"}
