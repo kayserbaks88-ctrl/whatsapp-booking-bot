@@ -89,16 +89,62 @@ def end_within_hours(start_dt, minutes):
     return end_dt.time() <= CLOSE_TIME and start_dt.date() == end_dt.date()
 
 def parse_dt(text):
-    s = {
+    """
+    Robust datetime parser for common WhatsApp inputs:
+    - "Monday 2pm", "Mon 2pm"
+    - "2pm Monday", "2pm Mon"
+    - "14:00 Monday"
+    - "10/02 15:30", "Sat 7 Feb 1pm", "tomorrow 2pm"
+    """
+    if not text:
+        return None
+
+    t = re.sub(r"\s+", " ", text.strip().lower())
+
+    # normalize punctuation
+    t = t.replace(",", " ")
+
+    # normalize short weekdays
+    weekday_map = {
+        "mon": "monday",
+        "tue": "tuesday",
+        "tues": "tuesday",
+        "wed": "wednesday",
+        "thu": "thursday",
+        "thur": "thursday",
+        "thurs": "thursday",
+        "fri": "friday",
+        "sat": "saturday",
+        "sun": "sunday",
+    }
+    parts = t.split()
+    parts = [weekday_map.get(p, p) for p in parts]
+    t = " ".join(parts)
+
+    # swap "2pm monday" / "14:00 monday" -> "monday 2pm"
+    parts = t.split()
+    if len(parts) == 2:
+        first, second = parts[0], parts[1]
+        looks_like_time = ("am" in first) or ("pm" in first) or (":" in first) or first.isdigit()
+        looks_like_weekday = second in weekday_map.values()
+        if looks_like_time and looks_like_weekday:
+            t = f"{second} {first}"
+
+    settings = {
         "TIMEZONE": TIMEZONE,
         "RETURN_AS_TIMEZONE_AWARE": True,
         "PREFER_DATES_FROM": "future",
         "RELATIVE_BASE": now(),
     }
-    dt = dateparser.parse(text, settings=s)
+
+    # Force English to avoid environment/locale weirdness on hosting
+    dt = dateparser.parse(t, settings=settings, languages=["en"])
+
     if not dt:
         return None
+
     return dt.astimezone(TZ)
+
 
 def menu():
     # price only (no durations shown)
