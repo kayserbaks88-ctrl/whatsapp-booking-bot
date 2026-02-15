@@ -106,13 +106,12 @@ def next_available_slots(
     duration_minutes: int,
     timezone: str,
     step_minutes: int = 15,
-    max_results: int = 5,
+    count: int = 5,
     search_days: int = 7,
     buffer_minutes: int = 0,
 ):
     """
     Finds next available start times after from_dt.
-    Uses duration + buffer for checks (buffer=cleanup time).
     NOTE: opening hours are enforced in WhatsApp_bot.py; this function only finds non-overlapping slots.
     """
     tz = ZoneInfo(timezone)
@@ -128,9 +127,7 @@ def next_available_slots(
     cursor = from_dt
     end_search = from_dt + timedelta(days=search_days)
 
-    effective_minutes = duration_minutes + max(0, buffer_minutes)
-
-    while cursor < end_search and len(results) < max_results:
+    while cursor < end_search and len(results) < count:
         ok, _ = is_time_available(
             cursor,
             calendar_id,
@@ -146,24 +143,26 @@ def next_available_slots(
     return results
 
 
-# ---------- EVENTS ----------
+# ---------- EVENTS (MATCH WhatsApp_bot.py) ----------
 
 def create_booking_event(
     calendar_id: str,
-    service_name: str,
-    customer_name: str,
     start_dt: datetime,
     duration_minutes: int,
-    phone: str,
+    title: str,
+    description: str,
     timezone: str,
 ):
+    """
+    Returns (event_id, event_link) to match WhatsApp_bot.py
+    """
     tz = ZoneInfo(timezone)
     start_dt = _to_tz(start_dt, tz)
     end_dt = start_dt + timedelta(minutes=duration_minutes)
 
     body = {
-        "summary": f"{service_name} — {customer_name}",
-        "description": f"Customer: {customer_name}\nPhone: {phone}",
+        "summary": title,
+        "description": description,
         "start": {"dateTime": start_dt.isoformat(), "timeZone": timezone},
         "end": {"dateTime": end_dt.isoformat(), "timeZone": timezone},
     }
@@ -171,7 +170,7 @@ def create_booking_event(
     service = get_service()
     event = service.events().insert(calendarId=calendar_id, body=body).execute()
 
-    return {"event_id": event.get("id"), "html_link": event.get("htmlLink")}
+    return event.get("id"), event.get("htmlLink")
 
 
 def delete_booking_event(calendar_id: str, event_id: str):
@@ -204,46 +203,4 @@ def update_booking_event_time(
     service = get_service()
     event = service.events().patch(calendarId=calendar_id, eventId=event_id, body=body).execute()
 
-    return {"event_id": event.get("id"), "html_link": event.get("htmlLink")}
-
-
-def find_next_booking_by_phone(calendar_id: str, phone: str, timezone: str, days_ahead: int = 60):
-    """
-    Best-effort lookup: searches upcoming events containing the phone in description.
-    Returns (event_id, start_dt, end_dt, summary, htmlLink) or None
-    """
-    tz = ZoneInfo(timezone)
-    now = datetime.now(tz)
-    time_max = now + timedelta(days=days_ahead)
-
-    service = get_service()
-    resp = service.events().list(
-        calendarId=calendar_id,
-        timeMin=now.isoformat(),
-        timeMax=time_max.isoformat(),
-        singleEvents=True,
-        orderBy="startTime",
-        q=phone,
-        maxResults=10,
-    ).execute()
-
-    items = resp.get("items", [])
-    if not items:
-        return None
-
-    e = items[0]
-    start_raw = e.get("start", {}).get("dateTime")
-    end_raw = e.get("end", {}).get("dateTime")
-    if not start_raw or not end_raw:
-        return None
-
-    start_dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).astimezone(tz)
-    end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).astimezone(tz)
-
-    return {
-        "event_id": e.get("id"),
-        "start_dt": start_dt,
-        "end_dt": end_dt,
-        "summary": e.get("summary", ""),
-        "html_link": e.get("htmlLink"),
-    }
+    return event.get("id"), event.get("htmlLink")

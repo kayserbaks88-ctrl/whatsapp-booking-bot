@@ -48,8 +48,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "20"))
 
 # ---------------- SERVICES ----------------
-# Edit these freely. Price (£) + duration (mins)
-# You can keep it simple for selling, then expand per barber.
+# Price (£) + duration (mins)
 SERVICE_CATALOG = [
     # Core
     ("Haircut", 18, 45),
@@ -58,7 +57,7 @@ SERVICE_CATALOG = [
     ("Kids Cut", 15, 30),
     ("Shape Up", 12, 20),
 
-    # Add-ons / common upsells
+    # Add-ons / grooming
     ("Eyebrow Trim", 6, 10),
     ("Nose Wax", 8, 10),
     ("Ear Wax", 8, 10),
@@ -66,8 +65,7 @@ SERVICE_CATALOG = [
     ("Blow Dry", 10, 20),
 ]
 
-# Categories for a “real shop style” menu (like your screenshot).
-# Only items that exist in SERVICE_CATALOG should be referenced here.
+# Categories for “real shop menu”
 CATEGORIES = {
     "Men’s Cuts": ["Haircut", "Skin Fade", "Shape Up"],
     "Beard / Shaves": ["Beard Trim", "Hot Towel Shave"],
@@ -85,16 +83,19 @@ SERVICE_ALIASES = {
     "hair cut": "Haircut",
     "cut": "Haircut",
     "line up": "Shape Up",
+    "lineup": "Shape Up",
     "shapeup": "Shape Up",
     "beard": "Beard Trim",
     "brows": "Eyebrow Trim",
     "eyebrows": "Eyebrow Trim",
+    "brow": "Eyebrow Trim",
     "nose waxing": "Nose Wax",
     "ear waxing": "Ear Wax",
     "hot towel": "Hot Towel Shave",
+    "shave": "Hot Towel Shave",
 }
 
-# In-memory session state (simple local memory)
+# In-memory session state
 user_state = {}
 
 # ---------------- HELPERS ----------------
@@ -128,7 +129,6 @@ def parse_dt(text: str):
     if not text:
         return None
 
-    # Clean common WhatsApp input
     t = text.strip()
     t = re.sub(r"[,]+", " ", t)
     t = re.sub(r"\s+", " ", t)
@@ -148,7 +148,6 @@ def parse_dt(text: str):
     try:
         return dt.astimezone(TZ)
     except Exception:
-        # If dateparser returns naive, attach TZ
         return dt.replace(tzinfo=TZ)
 
 def services_total_minutes(services):
@@ -158,12 +157,9 @@ def services_total_price(services):
     return sum(s["price"] for s in services)
 
 def summarize_services(services):
-    # "Haircut + Eyebrow Trim"
     return " + ".join(s["name"] for s in services)
 
 def menu_text():
-    # Build a “shop style” menu with categories + numbered items
-    # but still lets user reply by number.
     lines = []
     lines.append(f"💈 *{SHOP_NAME}*")
     lines.append("Reply with *number* or *name*:")
@@ -180,9 +176,9 @@ def menu_text():
             n += 1
         lines.append("")
 
-    lines.append(f"Hours: Mon–Sat 9am–6pm | Sun Closed")
+    lines.append("Hours: Mon–Sat 9am–6pm | Sun Closed")
     lines.append("")
-    lines.append("Tip: you can also type: *“book haircut Monday 2pm”*")
+    lines.append("Tip: you can also type: *“Can I book a haircut tomorrow at 2pm?”*")
     return "\n".join(lines), numbered
 
 def pick_service_by_number(num: int, numbered_names):
@@ -193,10 +189,6 @@ def pick_service_by_number(num: int, numbered_names):
     return None
 
 def resolve_services(raw_services):
-    """
-    raw_services can be ["haircut", "brows"] etc
-    returns list of service dicts
-    """
     out = []
     seen = set()
 
@@ -204,15 +196,12 @@ def resolve_services(raw_services):
         if not s:
             continue
         t = norm(str(s))
-
-        # apply alias mapping
-        t = SERVICE_ALIASES.get(t, s)
+        t = SERVICE_ALIASES.get(t, t)
         key = norm(t)
 
         if key in SERVICE_MAP:
             name, price, mins = SERVICE_MAP[key]
         else:
-            # fuzzy contains match (safe small)
             found = None
             for k in SERVICE_MAP.keys():
                 if k in key or key in k:
@@ -230,14 +219,9 @@ def resolve_services(raw_services):
     return out
 
 def looks_like_booking_text(t: str) -> bool:
-    """
-    Avoid calling LLM for random messages.
-    Only call if text looks like booking intent.
-    """
     if not t:
         return False
 
-    # contains time-ish or date-ish
     if re.search(r"\b(tomorrow|today|mon|tue|wed|thu|fri|sat|sunday|next)\b", t):
         return True
     if re.search(r"\b\d{1,2}(:\d{2})?\s?(am|pm)\b", t):
@@ -245,15 +229,10 @@ def looks_like_booking_text(t: str) -> bool:
     if re.search(r"\b\d{1,2}[\/\-]\d{1,2}\b", t):
         return True
 
-    # booking verbs / service words
     keywords = ["book", "appointment", "haircut", "fade", "beard", "brow", "eyebrow", "shape", "trim", "wax", "shave"]
     return any(k in t for k in keywords)
 
 def call_openai_json(user_text: str):
-    """
-    Uses OpenAI Responses API with JSON Schema structured output.
-    Returns dict: {"services":[...], "datetime_text":"..."} or None.
-    """
     if not OPENAI_API_KEY:
         return None
 
@@ -262,20 +241,13 @@ def call_openai_json(user_text: str):
         "schema": {
             "type": "object",
             "properties": {
-                "services": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of service names or service keywords mentioned by the user."
-                },
-                "datetime_text": {
-                    "type": ["string", "null"],
-                    "description": "The time/date phrase from the user, e.g. 'Monday 2pm' or 'tomorrow at 3'."
-                }
+                "services": {"type": "array", "items": {"type": "string"}},
+                "datetime_text": {"type": ["string", "null"]},
             },
             "required": ["services", "datetime_text"],
-            "additionalProperties": False
+            "additionalProperties": False,
         },
-        "strict": True
+        "strict": True,
     }
 
     system = (
@@ -304,29 +276,30 @@ def call_openai_json(user_text: str):
             data=json.dumps(payload),
             timeout=OPENAI_TIMEOUT,
         )
+
         if r.status_code >= 300:
+            print("OpenAI error:", r.status_code, r.text)
             return None
 
         data = r.json()
-
-        # Try to find the output text
-        # Responses API returns output items; we find output_text content and parse JSON
         output = data.get("output") or []
+
         for item in output:
             content = item.get("content") or []
             for c in content:
                 if c.get("type") in ("output_text", "text"):
-                    txt = c.get("text") or ""
-                    txt = txt.strip()
+                    txt = (c.get("text") or "").strip()
                     if not txt:
                         continue
                     try:
                         return json.loads(txt)
                     except Exception:
-                        # Sometimes it might already be a dict-ish string; fail gracefully
                         return None
+
         return None
-    except Exception:
+
+    except Exception as e:
+        print("OpenAI exception:", e)
         return None
 
 # ---------------- ROUTES ----------------
@@ -348,7 +321,6 @@ def whatsapp():
     step = st.get("step", "START")
 
     # ---- SMART FREE-TEXT (LLM extractor) ----
-    # Only try when user is not using strict commands
     if t not in {"menu", "cancel", "view", "reschedule", "yes", "no", "back"} and looks_like_booking_text(t):
         data = call_openai_json(body)
         if data:
@@ -357,7 +329,7 @@ def whatsapp():
 
             services = resolve_services(raw_services)
 
-            # If user typed service(s) + time in one message, jump ahead
+            # service(s) + time in one message
             if services and datetime_text:
                 dt = parse_dt(datetime_text)
                 if dt:
@@ -382,7 +354,7 @@ def whatsapp():
                             )
                             return str(resp)
 
-            # If we got services but no time, move user to TIME step
+            # services only (no time)
             if services and step in {"START", "SERVICE"}:
                 user_state[from_] = {"step": "TIME", "services": services}
                 msg.body(
@@ -402,7 +374,6 @@ def whatsapp():
         return str(resp)
 
     if t == "back":
-        # step back one stage
         if step == "TIME":
             m, numbered_names = menu_text()
             user_state[from_] = {"step": "SERVICE", "numbered_names": numbered_names}
@@ -413,7 +384,12 @@ def whatsapp():
             msg.body("↩️ Back. What day & time?\nExamples: Tomorrow 2pm / Mon 3:15pm / 10/02 15:30")
             return str(resp)
         if step == "CONFIRM":
-            user_state[from_] = {"step": "NAME", "services": st.get("services", []), "dt": st.get("dt"), "hold_until": st.get("hold_until")}
+            user_state[from_] = {
+                "step": "NAME",
+                "services": st.get("services", []),
+                "dt": st.get("dt"),
+                "hold_until": st.get("hold_until")
+            }
             msg.body("↩️ Back. What’s your name?")
             return str(resp)
 
@@ -421,7 +397,6 @@ def whatsapp():
         return str(resp)
 
     if t == "cancel":
-        # cancel existing booking if we have event_id in state
         event_id = st.get("event_id")
         if event_id:
             try:
@@ -445,7 +420,6 @@ def whatsapp():
         return str(resp)
 
     if t == "reschedule":
-        # only if they have existing booking with event_id
         if st.get("event_id"):
             user_state[from_] = {"step": "RESCHEDULE_TIME", "event_id": st.get("event_id"), "services": st.get("services", [])}
             msg.body("🕒 What new day & time?\nExamples:\n• Tomorrow 2pm\n• Mon 3:15pm\n• 10/02 15:30")
@@ -459,14 +433,11 @@ def whatsapp():
     if step == "SERVICE":
         numbered_names = st.get("numbered_names") or menu_text()[1]
 
-        # Allow: "2" or "skin fade" or "haircut + brows"
-        # If they type multiple services, split by + / and / comma
         raw = re.split(r"\s*(\+|,| and )\s*", body, flags=re.IGNORECASE)
         raw = [x for x in raw if x and x.strip() and x.strip() not in {"+", ",", "and"}]
 
         picked = []
 
-        # if single digit selection
         if len(raw) == 1 and raw[0].strip().isdigit():
             svc = pick_service_by_number(int(raw[0].strip()), numbered_names)
             if svc:
@@ -474,30 +445,26 @@ def whatsapp():
         else:
             for part in raw:
                 part_norm = norm(part)
-                # number inside multi
+
                 if part_norm.isdigit():
                     svc = pick_service_by_number(int(part_norm), numbered_names)
                     if svc:
                         picked.append(svc)
                     continue
 
-                # alias mapping
                 part_norm = SERVICE_ALIASES.get(part_norm, part_norm)
 
-                # exact match
                 if part_norm in SERVICE_MAP:
                     name, price, mins = SERVICE_MAP[part_norm]
                     picked.append({"name": name, "price": price, "minutes": mins})
                     continue
 
-                # fuzzy match
                 for k in SERVICE_MAP.keys():
                     if k in part_norm or part_norm in k:
                         name, price, mins = SERVICE_MAP[k]
                         picked.append({"name": name, "price": price, "minutes": mins})
                         break
 
-        # de-dup
         seen = set()
         services = []
         for s in picked:
@@ -526,28 +493,26 @@ def whatsapp():
             msg.body("Session reset. Reply MENU.")
             return str(resp)
 
-    # First try normal parsing
-    dt = parse_dt(body)
-
-    # If normal parsing fails, try LLM extraction
-    if not dt and OPENAI_API_KEY:
-        data = call_openai_json(body)
-        if data:
-            datetime_text = data.get("datetime_text")
-            if datetime_text:
-                dt = parse_dt(datetime_text)
-
-    # If still no datetime, show error
-    if not dt:
-        msg.body(
-            "I didn’t understand the time.\n"
-            "Try: Tomorrow 2pm / Mon 3:15pm / 10/02 15:30\n\n"
-            "Reply BACK to change service."
-        )
-        return str(resp)
-
-
+        # 1) Normal parse
         dt = parse_dt(body)
+
+        # 2) LLM fallback for messy time text while in TIME step
+        if not dt and OPENAI_API_KEY:
+            data = call_openai_json(body)
+            if data:
+                datetime_text = data.get("datetime_text")
+                if datetime_text:
+                    dt = parse_dt(datetime_text)
+
+        # 3) Regex safety fallback (last resort)
+        if not dt:
+            possible = re.search(
+                r"(tomorrow.*|today.*|\bmon\b.*|\btue\b.*|\bwed\b.*|\bthu\b.*|\bfri\b.*|\bsat\b.*|\bsun\b.*|\d{1,2}(:\d{2})?\s?(am|pm))",
+                body.lower()
+            )
+            if possible:
+                dt = parse_dt(possible.group(1))
+
         if not dt:
             msg.body("I didn’t understand the time.\nTry: Tomorrow 2pm / Mon 3:15pm / 10/02 15:30\n\nReply BACK to change service.")
             return str(resp)
@@ -563,7 +528,6 @@ def whatsapp():
             buffer_minutes=BOOKING_BUFFER_MINUTES
         )
         if not ok:
-            # suggest next slots
             next_slots = next_available_slots(
                 dt, CALENDAR_ID, total_minutes, TIMEZONE,
                 step_minutes=SLOT_STEP_MINUTES,
@@ -652,7 +616,6 @@ def whatsapp():
             msg.body("⏳ Hold expired. Please send the time again.\nExample: Tomorrow 2pm")
             return str(resp)
 
-        # Create calendar event
         total_minutes = services_total_minutes(services)
         title = f"{summarize_services(services)} - {customer_name}"
         description = (
@@ -729,13 +692,11 @@ def whatsapp():
             msg.body("\n".join(lines))
             return str(resp)
 
-        # simplest reschedule: delete + create new (keeps your code simple/stable)
         try:
             delete_booking_event(CALENDAR_ID, event_id)
         except Exception:
             pass
 
-        # reuse name if we have it
         customer_name = st.get("name", "Customer")
         title = f"{summarize_services(services) if services else 'Booking'} - {customer_name}"
         description = f"Rescheduled via {BUSINESS_NAME}"
