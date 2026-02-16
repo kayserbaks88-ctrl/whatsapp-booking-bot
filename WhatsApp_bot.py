@@ -18,11 +18,9 @@ from calendar_helper import (
 )
 
 load_dotenv()
-
 app = Flask(__name__)
 
 # ---------------- CONFIG ----------------
-
 BUSINESS_NAME = os.getenv("BUSINESS_NAME", "TrimTech AI")
 SHOP_NAME = os.getenv("SHOP_NAME", "BBC Barbers")
 
@@ -42,14 +40,10 @@ CLOSE_TIME = time(18, 0)
 
 # ----- LLM config -----
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
-# Support your Render typo: OPENAI_MODE (wrong) OR OPENAI_MODEL (correct)
-OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or os.getenv("OPENAI_MODE") or "gpt-4o-mini").strip()
-
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()   # <-- IMPORTANT
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "20"))
 
 # ---------------- SERVICES ----------------
-
 SERVICE_CATALOG = [
     ("Haircut", 18, 45),
     ("Skin Fade", 22, 60),
@@ -87,11 +81,9 @@ SERVICE_ALIASES = {
     "hot towel": "Hot Towel Shave",
 }
 
-# In-memory session state
 user_state = {}
 
 # ---------------- HELPERS ----------------
-
 def now() -> datetime:
     return datetime.now(TZ)
 
@@ -170,7 +162,7 @@ def menu_text():
 
     lines.append("Hours: Mon–Sat 9am–6pm | Sun Closed")
     lines.append("")
-    lines.append("Tip: you can also type: *“Can I book a haircut tomorrow at 2pm?”*")
+    lines.append('Tip: you can also type: *"Can I book a haircut tomorrow at 2pm?"*')
     return "\n".join(lines), numbered
 
 def pick_service_by_number(num: int, numbered_names):
@@ -183,12 +175,11 @@ def pick_service_by_number(num: int, numbered_names):
 def resolve_services(raw_services):
     out = []
     seen = set()
-
     for s in raw_services or []:
         if not s:
             continue
         t = norm(str(s))
-        t = SERVICE_ALIASES.get(t, s)
+        t = SERVICE_ALIASES.get(t, t)
         key = norm(t)
 
         if key in SERVICE_MAP:
@@ -207,28 +198,24 @@ def resolve_services(raw_services):
             continue
         seen.add(name.lower())
         out.append({"name": name, "price": price, "minutes": mins})
-
     return out
 
 def looks_like_booking_text(t: str) -> bool:
     if not t:
         return False
-    tt = t.lower()
-
-    if re.search(r"\b(tomorrow|today|mon|tue|wed|thu|fri|sat|sunday|next)\b", tt):
+    if re.search(r"\b(tomorrow|today|mon|tue|wed|thu|fri|sat|sunday|next)\b", t):
         return True
-    if re.search(r"\b\d{1,2}(:\d{2})?\s?(am|pm)\b", tt):
+    if re.search(r"\b\d{1,2}(:\d{2})?\s?(am|pm)\b", t):
         return True
-    if re.search(r"\b\d{1,2}[\/\-]\d{1,2}\b", tt):
+    if re.search(r"\b\d{1,2}[\/\-]\d{1,2}\b", t):
         return True
-
     keywords = ["book", "appointment", "haircut", "fade", "beard", "brow", "eyebrow", "shape", "trim", "wax", "shave"]
-    return any(k in tt for k in keywords)
+    return any(k in t for k in keywords)
 
 def call_openai_json(user_text: str):
     """
-    Returns dict {"services":[...], "datetime_text": "..."} or None
-    Uses Responses API with JSON Schema.
+    Returns dict: {"services":[...], "datetime_text":"..."} or None.
+    Uses Responses API with json_schema.
     """
     if not OPENAI_API_KEY:
         return None
@@ -238,27 +225,21 @@ def call_openai_json(user_text: str):
         "schema": {
             "type": "object",
             "properties": {
-                "services": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of service words the user mentioned."
-                },
-                "datetime_text": {
-                    "type": ["string", "null"],
-                    "description": "The date/time phrase, e.g. 'tomorrow 2pm'."
-                }
+                "services": {"type": "array", "items": {"type": "string"}},
+                "datetime_text": {"type": ["string", "null"]},
             },
             "required": ["services", "datetime_text"],
-            "additionalProperties": False
+            "additionalProperties": False,
         },
-        "strict": True
+        "strict": True,
     }
 
     system = (
-        "You extract booking info for a UK barbershop.\n"
+        f"You extract booking info for a UK barbershop.\n"
         f"Timezone: {TIMEZONE}. Date format: DMY.\n"
-        "Return services as user words (can be fuzzy: fade, brows, haircut).\n"
-        "If no datetime phrase present, datetime_text must be null."
+        f"Services can be words like: haircut, fade, beard, brows, shape up.\n"
+        f"Return datetime_text as the phrase the user said (e.g. 'tomorrow at 2pm').\n"
+        f"If no time phrase exists, datetime_text must be null."
     )
 
     payload = {
@@ -285,11 +266,11 @@ def call_openai_json(user_text: str):
             return None
 
         data = r.json()
-        output = data.get("output") or []
 
-        for item in output:
-            content = item.get("content") or []
-            for c in content:
+        # Robust parse across Responses output shapes
+        out_items = data.get("output", []) or []
+        for item in out_items:
+            for c in (item.get("content") or []):
                 if c.get("type") in ("output_text", "text"):
                     txt = (c.get("text") or "").strip()
                     if not txt:
@@ -299,82 +280,22 @@ def call_openai_json(user_text: str):
                     except Exception:
                         return None
 
+        # Sometimes model output may appear under "output_text"
+        txt2 = (data.get("output_text") or "").strip()
+        if txt2:
+            try:
+                return json.loads(txt2)
+            except Exception:
+                return None
+
         return None
     except Exception:
         return None
 
-def try_llm_booking_jump(from_, body):
-    """
-    If user sends: 'Can I book haircut tomorrow 2pm?'
-    This will set state and return a Twilio message string if successful; else None.
-    """
-    if not looks_like_booking_text(body):
-        return None
-
-    data = call_openai_json(body)
-    if not data:
-        return None
-
-    raw_services = data.get("services") or []
-    datetime_text = data.get("datetime_text")
-
-    services = resolve_services(raw_services)
-
-    # If LLM found BOTH service + datetime, jump straight to hold
-    if services and datetime_text:
-        dt = parse_dt(datetime_text)
-        if not dt:
-            return None
-
-        total_minutes = services_total_minutes(services)
-
-        if not within_hours(dt) or not end_within_hours(dt, total_minutes):
-            return None
-
-        ok, reason = is_time_available(
-            dt, CALENDAR_ID, total_minutes, TIMEZONE,
-            buffer_minutes=BOOKING_BUFFER_MINUTES
-        )
-        if not ok:
-            return None
-
-        user_state[from_] = {
-            "step": "NAME",
-            "services": services,
-            "dt": dt,
-            "hold_until": now() + timedelta(minutes=HOLD_EXPIRE_MINUTES),
-        }
-
-        resp = MessagingResponse()
-        resp.message().body(
-            f"✅ Time held: {fmt(dt)}\n\n"
-            f"Service(s): {summarize_services(services)}\n"
-            f"Total: £{services_total_price(services)} • {total_minutes} mins\n\n"
-            "What’s your name?"
-        )
-        return str(resp)
-
-    # If LLM found services only -> move to TIME
-    if services:
-        user_state[from_] = {"step": "TIME", "services": services}
-        resp = MessagingResponse()
-        resp.message().body(
-            f"🪒 {summarize_services(services)}\n\n"
-            "What day & time?\n"
-            "Examples:\n• Tomorrow 2pm\n• Mon 3:15pm\n• 10/02 15:30\n\n"
-            "Reply BACK to change service."
-        )
-        return str(resp)
-
-    return None
-
-
 # ---------------- ROUTES ----------------
-
 @app.get("/")
 def health():
     return "OK", 200
-
 
 @app.post("/whatsapp")
 def whatsapp():
@@ -388,14 +309,53 @@ def whatsapp():
     st = user_state.get(from_, {"step": "START"})
     step = st.get("step", "START")
 
-    # ✅ IMPORTANT: LLM runs FIRST (before menu), but only when it looks like booking text
-    if t not in {"menu", "start", "hi", "hello", "hey", "cancel", "view", "reschedule", "yes", "no", "back"}:
-        llm_resp = try_llm_booking_jump(from_, body)
-        if llm_resp:
-            return llm_resp
+    # ---- SMART FREE-TEXT (LLM) ----
+    # (Works even if user is currently in SERVICE/TIME/START)
+    if t not in {"menu", "cancel", "view", "reschedule", "yes", "no", "back"} and looks_like_booking_text(t):
+        data = call_openai_json(body)
+        if data:
+            raw_services = data.get("services") or []
+            datetime_text = data.get("datetime_text")
+
+            services = resolve_services(raw_services)
+
+            # If message includes datetime, try to jump ahead (service + time)
+            if services and datetime_text:
+                dt = parse_dt(datetime_text)
+                if dt:
+                    total_minutes = services_total_minutes(services)
+                    if within_hours(dt) and end_within_hours(dt, total_minutes):
+                        ok, reason = is_time_available(
+                            dt, CALENDAR_ID, total_minutes, TIMEZONE,
+                            buffer_minutes=BOOKING_BUFFER_MINUTES
+                        )
+                        if ok:
+                            user_state[from_] = {
+                                "step": "NAME",
+                                "services": services,
+                                "dt": dt,
+                                "hold_until": now() + timedelta(minutes=HOLD_EXPIRE_MINUTES)
+                            }
+                            msg.body(
+                                f"✅ Time held: {fmt(dt)}\n\n"
+                                f"Service(s): {summarize_services(services)}\n"
+                                f"Total: £{services_total_price(services)} • {total_minutes} mins\n\n"
+                                f"What’s your name?"
+                            )
+                            return str(resp)
+
+            # If we got services but no usable time, move to TIME step
+            if services and step in {"START", "SERVICE", "TIME"}:
+                user_state[from_] = {"step": "TIME", "services": services}
+                msg.body(
+                    f"🪒 {summarize_services(services)}\n\n"
+                    f"What day & time?\n"
+                    f"Examples:\n• Tomorrow 2pm\n• Mon 3:15pm\n• 10/02 15:30\n\n"
+                    f"Reply BACK to change service."
+                )
+                return str(resp)
 
     # --------- Commands ---------
-
     if t in {"hi", "hello", "hey", "start", "menu"}:
         m, numbered_names = menu_text()
         user_state[from_] = {"step": "SERVICE", "numbered_names": numbered_names}
@@ -408,19 +368,12 @@ def whatsapp():
             user_state[from_] = {"step": "SERVICE", "numbered_names": numbered_names}
             msg.body("↩️ Back to menu:\n\n" + m)
             return str(resp)
-
         if step == "NAME":
             user_state[from_] = {"step": "TIME", "services": st.get("services", [])}
             msg.body("↩️ Back. What day & time?\nExamples: Tomorrow 2pm / Mon 3:15pm / 10/02 15:30")
             return str(resp)
-
         if step == "CONFIRM":
-            user_state[from_] = {
-                "step": "NAME",
-                "services": st.get("services", []),
-                "dt": st.get("dt"),
-                "hold_until": st.get("hold_until"),
-            }
+            user_state[from_] = {"step": "NAME", "services": st.get("services", []), "dt": st.get("dt"), "hold_until": st.get("hold_until")}
             msg.body("↩️ Back. What’s your name?")
             return str(resp)
 
@@ -452,12 +405,7 @@ def whatsapp():
 
     if t == "reschedule":
         if st.get("event_id"):
-            user_state[from_] = {
-                "step": "RESCHEDULE_TIME",
-                "event_id": st.get("event_id"),
-                "services": st.get("services", []),
-                "name": st.get("name", "Customer"),
-            }
+            user_state[from_] = {"step": "RESCHEDULE_TIME", "event_id": st.get("event_id"), "services": st.get("services", []), "name": st.get("name")}
             msg.body("🕒 What new day & time?\nExamples:\n• Tomorrow 2pm\n• Mon 3:15pm\n• 10/02 15:30")
             return str(resp)
 
@@ -465,15 +413,12 @@ def whatsapp():
         return str(resp)
 
     # --------- Flow ---------
-
     if step == "SERVICE":
         numbered_names = st.get("numbered_names") or menu_text()[1]
-
         raw = re.split(r"\s*(\+|,| and )\s*", body, flags=re.IGNORECASE)
-        raw = [x for x in raw if x and x.strip() and x.strip() not in {"+", ",", "and"}]
+        raw = [x for x in raw if x and x.strip() and x.strip().lower() not in {"+", ",", "and"}]
 
         picked = []
-
         if len(raw) == 1 and raw[0].strip().isdigit():
             svc = pick_service_by_number(int(raw[0].strip()), numbered_names)
             if svc:
@@ -481,7 +426,6 @@ def whatsapp():
         else:
             for part in raw:
                 part_norm = norm(part)
-
                 if part_norm.isdigit():
                     svc = pick_service_by_number(int(part_norm), numbered_names)
                     if svc:
@@ -510,15 +454,15 @@ def whatsapp():
             services.append(s)
 
         if not services:
-            msg.body("I didn’t recognize that service. Reply with a menu number or name.\n\nReply MENU to see options.")
+            msg.body("I didn’t recognize that service. Reply with a menu number or name. (Example: 1 or Haircut)\n\nReply MENU to see options.")
             return str(resp)
 
         user_state[from_] = {"step": "TIME", "services": services}
         msg.body(
             f"🪒 {summarize_services(services)}\n\n"
-            "What day & time?\n"
-            "Examples:\n• Tomorrow 2pm\n• Mon 3:15pm\n• 10/02 15:30\n\n"
-            "Reply BACK to change service."
+            f"What day & time?\n"
+            f"Examples:\n• Tomorrow 2pm\n• Mon 3:15pm\n• 10/02 15:30\n\n"
+            f"Reply BACK to change service."
         )
         return str(resp)
 
@@ -529,10 +473,11 @@ def whatsapp():
             msg.body("Session reset. Reply MENU.")
             return str(resp)
 
+        # 1) normal parse
         dt = parse_dt(body)
 
-        # ✅ If normal parsing fails, try LLM to extract datetime_text only
-        if not dt and looks_like_booking_text(body):
+        # 2) if parse fails, try LLM just for datetime extraction
+        if not dt and looks_like_booking_text(t):
             data = call_openai_json(body)
             if data:
                 dt_text = data.get("datetime_text")
@@ -540,11 +485,7 @@ def whatsapp():
                     dt = parse_dt(dt_text)
 
         if not dt:
-            msg.body(
-                "I didn’t understand the time.\n"
-                "Try: Tomorrow 2pm / Mon 3:15pm / 10/02 15:30\n\n"
-                "Reply BACK to change service."
-            )
+            msg.body("I didn’t understand the time.\nTry: Tomorrow 2pm / Mon 3:15pm / 10/02 15:30\n\nReply BACK to change service.")
             return str(resp)
 
         total_minutes = services_total_minutes(services)
@@ -581,7 +522,7 @@ def whatsapp():
             f"✅ Time held: {fmt(dt)}\n\n"
             f"Service(s): {summarize_services(services)}\n"
             f"Total: £{services_total_price(services)} • {total_minutes} mins\n\n"
-            "What’s your name?\n(Reply BACK to change time.)"
+            f"What’s your name?\n(Reply BACK to change time.)"
         )
         return str(resp)
 
@@ -653,8 +594,7 @@ def whatsapp():
             f"Shop: {SHOP_NAME}\n"
             f"Customer: {customer_name}\n"
             f"Services: {summarize_services(services)}\n"
-            f"Total: £{services_total_price(services)} • {total_minutes} mins\n"
-            f"WhatsApp: {from_}"
+            f"Total: £{services_total_price(services)} • {total_minutes} mins"
         )
 
         try:
@@ -697,7 +637,7 @@ def whatsapp():
         customer_name = st.get("name", "Customer")
 
         dt = parse_dt(body)
-        if not dt and looks_like_booking_text(body):
+        if not dt and looks_like_booking_text(t):
             data = call_openai_json(body)
             if data:
                 dt_text = data.get("datetime_text")
@@ -737,7 +677,7 @@ def whatsapp():
             pass
 
         title = f"{summarize_services(services) if services else 'Booking'} - {customer_name}"
-        description = f"Rescheduled via {BUSINESS_NAME}\nWhatsApp: {from_}"
+        description = f"Rescheduled via {BUSINESS_NAME}"
 
         try:
             new_event_id, new_event_link = create_booking_event(
@@ -776,7 +716,6 @@ def whatsapp():
     m, _ = menu_text()
     msg.body(m)
     return str(resp)
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
