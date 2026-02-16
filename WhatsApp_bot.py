@@ -321,7 +321,8 @@ def whatsapp():
     step = st.get("step", "START")
 
     # ---- SMART FREE-TEXT (LLM extractor) ----
-    if t not in {"menu", "cancel", "view", "reschedule", "yes", "no", "back"} and looks_like_booking_text(t):
+    if looks_like_booking_text(body):
+        
         data = call_openai_json(body)
         if data:
             raw_services = data.get("services") or []
