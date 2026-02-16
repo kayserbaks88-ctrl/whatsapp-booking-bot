@@ -1,73 +1,71 @@
 import os
-import json
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-def _get_calendar_service():
-    raw = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
-    if not raw:
+def _get_service():
+    """
+    Uses GOOGLE_CREDENTIALS_JSON (a JSON string) from env.
+    """
+    creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+    if not creds_json:
         raise RuntimeError("Missing GOOGLE_CREDENTIALS_JSON env var")
 
-    info = json.loads(raw)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    import json
+    info = json.loads(creds_json)
+
+    creds = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/calendar"],
+    )
     return build("calendar", "v3", credentials=creds)
 
-def _to_rfc3339(dt: datetime):
+
+def _to_rfc3339(dt: datetime) -> str:
     if dt.tzinfo is None:
-        raise ValueError("Datetime must be timezone aware")
+        raise ValueError("datetime must be timezone-aware")
     return dt.isoformat()
 
-def is_time_available(calendar_id: str, start_dt: datetime, duration_mins: int, tz: ZoneInfo) -> bool:
-    svc = _get_calendar_service()
-    if start_dt.tzinfo is None:
-        start_dt = start_dt.replace(tzinfo=tz)
-    end_dt = start_dt + timedelta(minutes=duration_mins)
 
-    events = svc.events().list(
-        calendarId=calendar_id,
-        timeMin=_to_rfc3339(start_dt),
-        timeMax=_to_rfc3339(end_dt),
-        singleEvents=True,
-        orderBy="startTime",
-    ).execute()
+def is_time_available(calendar_id: str, start_dt: datetime, end_dt: datetime) -> bool:
+    svc = _get_service()
+    body = {
+        "timeMin": _to_rfc3339(start_dt),
+        "timeMax": _to_rfc3339(end_dt),
+        "items": [{"id": calendar_id}],
+    }
+    res = svc.freebusy().query(body=body).execute()
+    busy = res.get("calendars", {}).get(calendar_id, {}).get("busy", [])
+    return len(busy) == 0
 
-    items = events.get("items", [])
-    return len(items) == 0
 
 def next_available_slots(
     calendar_id: str,
-    tz: ZoneInfo,
-    duration_mins: int,
-    count: int = 3,
-    step_mins: int = 15,
-    open_days=None,
-    open_time: time = time(9, 0),
-    close_time: time = time(18, 0),
+    day_start: datetime,
+    day_end: datetime,
+    duration_minutes: int,
+    step_minutes: int = 15,
+    limit: int = 3,
 ):
-    now = datetime.now(tz)
-    # start searching from next step
-    cursor = (now + timedelta(minutes=step_mins)).replace(second=0, microsecond=0)
-    out = []
+    """
+    Returns list[datetime] start times for next available slots within [day_start, day_end].
+    """
+    slots = []
+    cursor = day_start
 
-    open_days = open_days or {"mon", "tue", "wed", "thu", "fri", "sat"}
+    while cursor + timedelta(minutes=duration_minutes) <= day_end:
+        end = cursor + timedelta(minutes=duration_minutes)
+        if is_time_available(calendar_id, cursor, end):
+            slots.append(cursor)
+            if len(slots) >= limit:
+                break
+        cursor += timedelta(minutes=step_minutes)
 
-    # search up to 30 days
-    for _ in range(int((30 * 24 * 60) / step_mins)):
-        dow = cursor.strftime("%a").lower()[:3]
-        if dow in open_days and open_time <= cursor.time() <= close_time:
-            end_dt = cursor + timedelta(minutes=duration_mins)
-            if end_dt.time() <= close_time:
-                if is_time_available(calendar_id, cursor, duration_mins, tz):
-                    out.append(cursor)
-                    if len(out) >= count:
-                        return out
-        cursor += timedelta(minutes=step_mins)
-    return out
+    return slots
+
 
 def create_booking_event(
     calendar_id: str,
@@ -76,29 +74,27 @@ def create_booking_event(
     summary: str,
     description: str = "",
     phone: str | None = None,
-    customer_name: str | None = None,
     service_name: str | None = None,
 ):
     """
-    phone is optional and accepted so WhatsApp_bot.py never crashes.
+    phone/service_name are OPTIONAL, so WhatsApp_bot can pass them safely.
     """
-    svc = _get_calendar_service()
+    svc = _get_service()
 
-    lines = []
+    desc_lines = []
     if description:
-        lines.append(description)
+        desc_lines.append(description)
     if service_name:
-        lines.append(f"Service: {service_name}")
-    if customer_name:
-        lines.append(f"Name: {customer_name}")
+        desc_lines.append(f"Service: {service_name}")
     if phone:
-        lines.append(f"Phone: {phone}")
+        desc_lines.append(f"Customer: {phone}")
 
-    body = {
+    event = {
         "summary": summary,
-        "description": "\n".join(lines).strip(),
+        "description": "\n".join(desc_lines).strip(),
         "start": {"dateTime": _to_rfc3339(start_dt)},
         "end": {"dateTime": _to_rfc3339(end_dt)},
     }
 
-    return svc.events().insert(calendarId=calendar_id, body=body).execute()
+    created = svc.events().insert(calendarId=calendar_id, body=event).execute()
+    return created
