@@ -1,104 +1,104 @@
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from dotenv import load_dotenv
-
-load_dotenv()
-
-TIMEZONE = os.getenv("TIMEZONE_HINT", "Europe/London")
-TZ = ZoneInfo(TIMEZONE)
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 def _get_calendar_service():
-    """
-    Supports:
-    - GOOGLE_CREDENTIALS_JSON = full service account json text (recommended on Render)
-    OR
-    - credentials.json file in project (local)
-    """
-    creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON") or os.getenv("GOOGLE_CREDENTIALS")
-    if creds_json:
-        info = json.loads(creds_json)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-    else:
-        creds = service_account.Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+    raw = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+    if not raw:
+        raise RuntimeError("Missing GOOGLE_CREDENTIALS_JSON env var")
 
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+    info = json.loads(raw)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    return build("calendar", "v3", credentials=creds)
 
-def is_time_available(calendar_id: str, start_dt: datetime, end_dt: datetime) -> bool:
-    service = _get_calendar_service()
+def _to_rfc3339(dt: datetime):
+    if dt.tzinfo is None:
+        raise ValueError("Datetime must be timezone aware")
+    return dt.isoformat()
 
-    events = (
-        service.events()
-        .list(
-            calendarId=calendar_id,
-            timeMin=start_dt.isoformat(),
-            timeMax=end_dt.isoformat(),
-            singleEvents=True,
-            orderBy="startTime",
-        )
-        .execute()
-        .get("items", [])
-    )
+def is_time_available(calendar_id: str, start_dt: datetime, duration_mins: int, tz: ZoneInfo) -> bool:
+    svc = _get_calendar_service()
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=tz)
+    end_dt = start_dt + timedelta(minutes=duration_mins)
 
-    # if any event overlaps in the window -> not available
-    return len(events) == 0
+    events = svc.events().list(
+        calendarId=calendar_id,
+        timeMin=_to_rfc3339(start_dt),
+        timeMax=_to_rfc3339(end_dt),
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
 
-def next_available_slots(calendar_id: str, start_dt: datetime, duration_minutes: int, step_minutes: int = 15, limit: int = 3):
-    """
-    Find the next available slots starting from start_dt.
-    """
-    slots = []
-    cursor = start_dt
+    items = events.get("items", [])
+    return len(items) == 0
 
-    # search up to ~3 days ahead (plenty for your flow)
-    for _ in range(int((3 * 24 * 60) / step_minutes)):
-        end_dt = cursor + timedelta(minutes=duration_minutes)
-        if is_time_available(calendar_id, cursor, end_dt):
-            slots.append(cursor)
-            if len(slots) >= limit:
-                break
-        cursor = cursor + timedelta(minutes=step_minutes)
+def next_available_slots(
+    calendar_id: str,
+    tz: ZoneInfo,
+    duration_mins: int,
+    count: int = 3,
+    step_mins: int = 15,
+    open_days=None,
+    open_time: time = time(9, 0),
+    close_time: time = time(18, 0),
+):
+    now = datetime.now(tz)
+    # start searching from next step
+    cursor = (now + timedelta(minutes=step_mins)).replace(second=0, microsecond=0)
+    out = []
 
-    return slots
+    open_days = open_days or {"mon", "tue", "wed", "thu", "fri", "sat"}
+
+    # search up to 30 days
+    for _ in range(int((30 * 24 * 60) / step_mins)):
+        dow = cursor.strftime("%a").lower()[:3]
+        if dow in open_days and open_time <= cursor.time() <= close_time:
+            end_dt = cursor + timedelta(minutes=duration_mins)
+            if end_dt.time() <= close_time:
+                if is_time_available(calendar_id, cursor, duration_mins, tz):
+                    out.append(cursor)
+                    if len(out) >= count:
+                        return out
+        cursor += timedelta(minutes=step_mins)
+    return out
 
 def create_booking_event(
     calendar_id: str,
     start_dt: datetime,
     end_dt: datetime,
-    service_name: str,
-    customer_name: str = None,
-    phone: str = None,
-    **kwargs,
+    summary: str,
+    description: str = "",
+    phone: str | None = None,
+    customer_name: str | None = None,
+    service_name: str | None = None,
 ):
     """
-    Accepts phone (fixes your earlier crash) + ignores extra kwargs safely.
+    phone is optional and accepted so WhatsApp_bot.py never crashes.
     """
-    service = _get_calendar_service()
+    svc = _get_calendar_service()
 
-    title = f"{service_name}"
+    lines = []
+    if description:
+        lines.append(description)
+    if service_name:
+        lines.append(f"Service: {service_name}")
     if customer_name:
-        title += f" - {customer_name}"
-
-    description_parts = []
+        lines.append(f"Name: {customer_name}")
     if phone:
-        description_parts.append(f"Phone: {phone}")
-    if kwargs:
-        # keep any future fields without breaking
-        for k, v in kwargs.items():
-            description_parts.append(f"{k}: {v}")
+        lines.append(f"Phone: {phone}")
 
-    event = {
-        "summary": title,
-        "description": "\n".join(description_parts).strip(),
-        "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
-        "end": {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE},
+    body = {
+        "summary": summary,
+        "description": "\n".join(lines).strip(),
+        "start": {"dateTime": _to_rfc3339(start_dt)},
+        "end": {"dateTime": _to_rfc3339(end_dt)},
     }
 
-    created = service.events().insert(calendarId=calendar_id, body=event).execute()
-    return created.get("id")
+    return svc.events().insert(calendarId=calendar_id, body=body).execute()

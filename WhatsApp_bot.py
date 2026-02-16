@@ -1,6 +1,5 @@
 import os
 import re
-import json
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
@@ -8,6 +7,8 @@ import dateparser
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
+
+from openai import OpenAI
 
 from calendar_helper import (
     is_time_available,
@@ -18,7 +19,6 @@ from calendar_helper import (
 load_dotenv()
 
 # ---------------- CONFIG ----------------
-
 BUSINESS_NAME = os.getenv("BUSINESS_NAME", "TrimTech AI")
 SHOP_NAME = os.getenv("SHOP_NAME", "BBC Barbers")
 
@@ -28,39 +28,35 @@ TZ = ZoneInfo(TIMEZONE)
 CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 PORT = int(os.getenv("PORT", "5000"))
 
-SLOT_STEP_MINUTES = int(os.getenv("SLOT_STEP_MINUTES", "15"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1").strip()
+OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "20"))
+DEBUG_LLM = os.getenv("DEBUG_LLM", "0").strip() == "1"
+
+HOLD_EXPIRE_MINUTES = 10
+SLOT_STEP_MINUTES = 15
 
 OPEN_DAYS = {"mon", "tue", "wed", "thu", "fri", "sat"}
 OPEN_TIME = time(9, 0)
 CLOSE_TIME = time(18, 0)
 
-DEBUG_LLM = os.getenv("DEBUG_LLM", "").strip() in {"1", "true", "True", "yes", "YES"}
-
-# LLM
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip() or "gpt-5"
-OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "20"))
-
-# ---------------- SERVICES ----------------
-# (name, price, duration_minutes)
+# name, price, duration mins
 SERVICES = [
     ("Haircut", 18, 45),
     ("Skin Fade", 22, 60),
-    ("Shape Up", 12, 30),
-    ("Beard Trim", 10, 30),
-    ("Hot Towel Shave", 15, 45),
+    ("Shape Up", 12, 20),
+    ("Beard Trim", 10, 20),
+    ("Hot Towel Shave", 15, 30),
     ("Kids Cut", 15, 30),
-    ("Eyebrow Trim", 6, 15),
-    ("Nose Wax", 8, 15),
-    ("Ear Wax", 8, 15),
+    ("Eyebrow Trim", 6, 10),
+    ("Nose Wax", 8, 10),
+    ("Ear Wax", 8, 10),
     ("Blow Dry", 10, 15),
 ]
 
 SERVICE_ALIASES = {
     "haircut": "Haircut",
     "cut": "Haircut",
-    "mens cut": "Haircut",
-    "men cut": "Haircut",
     "skin fade": "Skin Fade",
     "fade": "Skin Fade",
     "shape up": "Shape Up",
@@ -68,354 +64,400 @@ SERVICE_ALIASES = {
     "beard": "Beard Trim",
     "beard trim": "Beard Trim",
     "hot towel": "Hot Towel Shave",
-    "hot towel shave": "Hot Towel Shave",
     "kids": "Kids Cut",
     "kids cut": "Kids Cut",
     "eyebrow": "Eyebrow Trim",
-    "eyebrow trim": "Eyebrow Trim",
     "nose wax": "Nose Wax",
     "ear wax": "Ear Wax",
     "blow dry": "Blow Dry",
 }
 
-SERVICE_BY_NUMBER = {str(i + 1): SERVICES[i][0] for i in range(len(SERVICES))}
-SERVICE_BY_NAME = {name.lower(): name for (name, _, _) in SERVICES}
+# ---------------- APP ----------------
+app = Flask(__name__)
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# ---------------- STATE (simple in-memory) ----------------
-# user_state[phone] = {"step": "...", "service": "Haircut", "dt": datetime|None}
-user_state = {}
+# super simple in-memory state
+STATE = {}  # phone -> dict
+
 
 # ---------------- HELPERS ----------------
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
-def menu_text() -> str:
-    lines = [f"💈 *{SHOP_NAME}*", "Reply with *number or name*:\n"]
-    # Grouping (same style you like)
-    groups = [
-        ("Men’s Cuts", ["Haircut", "Skin Fade", "Shape Up"]),
-        ("Beard / Shaves", ["Beard Trim", "Hot Towel Shave"]),
-        ("Kids", ["Kids Cut"]),
-        ("Grooming", ["Eyebrow Trim", "Nose Wax", "Ear Wax", "Blow Dry"]),
-    ]
 
-    name_to_meta = {n: (p, d) for (n, p, d) in SERVICES}
-    num_by_name = {v: k for k, v in SERVICE_BY_NUMBER.items()}
+def get_service_by_choice(choice: str):
+    c = norm(choice)
+    # number choice
+    if c.isdigit():
+        idx = int(c) - 1
+        if 0 <= idx < len(SERVICES):
+            return SERVICES[idx][0]
+    # name / alias
+    if c in SERVICE_ALIASES:
+        return SERVICE_ALIASES[c]
+    # fuzzy contains
+    for k, v in SERVICE_ALIASES.items():
+        if k in c:
+            return v
+    return None
 
-    idx = 1
-    for title, names in groups:
-        lines.append(f"*{title}*")
-        for n in names:
-            price, _dur = name_to_meta[n]
-            # Keep original numbering order from SERVICES list
-            num = num_by_name.get(n, str(idx))
-            lines.append(f"{num}) {n} — £{price}")
-            idx += 1
-        lines.append("")
 
-    lines.append(f"Hours: Mon–Sat 9am–6pm | Sun Closed\n")
-    lines.append('Tip: you can also type: *"Book haircut tomorrow at 2pm"*')
-    return "\n".join(lines).strip()
+def service_meta(service_name: str):
+    for name, price, mins in SERVICES:
+        if name == service_name:
+            return {"name": name, "price": price, "mins": mins}
+    return None
 
-def normalize_text(t: str) -> str:
-    return re.sub(r"\s+", " ", (t or "")).strip()
+
+def within_open_hours(dt: datetime, mins: int) -> bool:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+
+    dow = dt.strftime("%a").lower()[:3]
+    if dow not in OPEN_DAYS:
+        return False
+
+    start_t = dt.time()
+    end_dt = dt + timedelta(minutes=mins)
+    # must start >= open and end <= close
+    if start_t < OPEN_TIME:
+        return False
+    if end_dt.time() > CLOSE_TIME:
+        return False
+    return True
+
+
+def parse_datetime_text(text: str):
+    settings = {
+        "TIMEZONE": TIMEZONE,
+        "RETURN_AS_TIMEZONE_AWARE": True,
+        "PREFER_DATES_FROM": "future",
+    }
+    dt = dateparser.parse(text, settings=settings)
+    return dt
+
+
+def menu_text():
+    lines = []
+    lines.append(f"💈 {SHOP_NAME}")
+    lines.append("Reply with *number or name*:\n")
+
+    # grouping like your screenshot
+    lines.append("*Men’s Cuts*")
+    lines.append("1) Haircut — £18")
+    lines.append("2) Skin Fade — £22")
+    lines.append("3) Shape Up — £12\n")
+
+    lines.append("*Beard / Shaves*")
+    lines.append("4) Beard Trim — £10")
+    lines.append("5) Hot Towel Shave — £15\n")
+
+    lines.append("*Kids*")
+    lines.append("6) Kids Cut — £15\n")
+
+    lines.append("*Grooming*")
+    lines.append("7) Eyebrow Trim — £6")
+    lines.append("8) Nose Wax — £8")
+    lines.append("9) Ear Wax — £8")
+    lines.append("10) Blow Dry — £10\n")
+
+    lines.append("Hours: Mon–Sat 9am–6pm | Sun Closed")
+    lines.append('\nTip: you can also type: *Book haircut tomorrow at 2pm*')
+    return "\n".join(lines)
+
 
 def looks_like_booking_text(t: str) -> bool:
-    t = (t or "").lower()
-    if any(w in t for w in ["book", "booking", "appointment", "reserve"]):
-        return True
-    if any(s in t for s in ["haircut", "fade", "shape", "beard", "kids", "wax", "blow"]):
-        return True
-    # dates / times
+    t = norm(t)
     if re.search(r"\b(today|tomorrow|mon|tue|wed|thu|fri|sat|sun)\b", t):
         return True
     if re.search(r"\b\d{1,2}(:\d{2})?\s?(am|pm)\b", t):
         return True
-    if re.search(r"\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b", t):
+    if re.search(r"\b\d{1,2}[\/\-]\d{1,2}\b", t):
         return True
-    return False
+    keywords = ["book", "appointment", "haircut", "fade", "beard", "kids", "shape up"]
+    return any(k in t for k in keywords)
 
-def pick_service_from_text(t: str):
-    t0 = (t or "").lower().strip()
 
-    # number
-    if t0 in SERVICE_BY_NUMBER:
-        return SERVICE_BY_NUMBER[t0]
-
-    # exact name
-    if t0 in SERVICE_BY_NAME:
-        return SERVICE_BY_NAME[t0]
-
-    # alias match
-    for k, v in SERVICE_ALIASES.items():
-        if k in t0:
-            return v
-
-    return None
-
-def parse_datetime(text: str):
-    """Parse a date/time like 'tomorrow 2pm' or 'Wednesday 4pm' into aware datetime in TZ."""
-    text = normalize_text(text)
-    if not text:
-        return None
-
-    dt = dateparser.parse(
-        text,
-        settings={
-            "TIMEZONE": TIMEZONE,
-            "RETURN_AS_TIMEZONE_AWARE": True,
-            "PREFER_DATES_FROM": "future",
-            "DATE_ORDER": "DMY",
-        },
-    )
-    if not dt:
-        return None
-
-    # Ensure tz
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=TZ)
-    else:
-        dt = dt.astimezone(TZ)
-
-    return dt
-
-def within_open_hours(dt: datetime, duration_min: int) -> bool:
-    day = dt.strftime("%a").lower()[:3]  # mon/tue/...
-    if day not in OPEN_DAYS:
-        return False
-
-    start_t = dt.time()
-    end_dt = dt + timedelta(minutes=duration_min)
-    end_t = end_dt.time()
-
-    # same-day boundary check
-    if start_t < OPEN_TIME:
-        return False
-    if end_t > CLOSE_TIME:
-        return False
-    if end_dt.date() != dt.date():
-        return False
-
-    return True
-
-def service_duration(service_name: str) -> int:
-    for n, _p, d in SERVICES:
-        if n == service_name:
-            return d
-    return 45
-
-# ---------------- LLM (Structured output) ----------------
-
-def call_openai_json(user_text: str):
+def call_openai_booking_extract(user_text: str):
     """
     Returns dict like:
-      {"service":"Haircut"|"", "datetime_text":"tomorrow 2pm"|""}
-    Uses Chat Completions structured output (stable), with fallback to None.
+    {
+      "service": "Haircut" | null,
+      "datetime_text": "tomorrow 2pm" | null
+    }
     """
-    if not OPENAI_API_KEY:
+    if not client:
         return None
 
+    schema = {
+        "type": "object",
+        "properties": {
+            "service": {"type": ["string", "null"], "description": "Service name if present"},
+            "datetime_text": {"type": ["string", "null"], "description": "Date/time phrase if present"},
+        },
+        "required": ["service", "datetime_text"],
+        "additionalProperties": False,
+    }
+
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT)
-
-        schema = {
-            "name": "booking_extract",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "service": {"type": "string"},
-                    "datetime_text": {"type": "string"},
-                },
-                "required": ["service", "datetime_text"],
-                "additionalProperties": False,
-            },
-        }
-
-        resp = client.chat.completions.create(
+        resp = client.responses.create(
             model=OPENAI_MODEL,
-            messages=[
+            input=[
                 {
                     "role": "system",
                     "content": (
-                        f"You extract booking info for a barbershop called {SHOP_NAME}. "
-                        "Return ONLY JSON that matches the schema. "
-                        "If service missing, service should be empty string. "
-                        "If datetime missing, datetime_text should be empty string."
+                        "Extract booking info from the user's message.\n"
+                        f"Valid services: {', '.join([s[0] for s in SERVICES])}.\n"
+                        "Return null if missing.\n"
+                        "Do NOT invent details.\n"
                     ),
                 },
                 {"role": "user", "content": user_text},
             ],
-            response_format={"type": "json_schema", "json_schema": schema},
+            # IMPORTANT: Structured output for Responses API uses text.format,
+            # and MUST include a name.
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "booking_extract",   # <-- this fixes your 400 error
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+            timeout=OPENAI_TIMEOUT,
         )
 
-        content = resp.choices[0].message.content or "{}"
-        data = json.loads(content)
-
+        # Responses API: easiest is to read output_text then json-load it.
+        out = (resp.output_text or "").strip()
         if DEBUG_LLM:
-            print("[DEBUG] LLM raw:", content)
-            print("[DEBUG] LLM parsed:", data)
+            print("[DEBUG] LLM raw:", out)
 
-        # normalize
-        data["service"] = (data.get("service") or "").strip()
-        data["datetime_text"] = (data.get("datetime_text") or "").strip()
+        import json
+        data = json.loads(out) if out else None
+        if DEBUG_LLM:
+            print("[DEBUG] LLM json:", data)
         return data
 
     except Exception as e:
-        # IMPORTANT: If you ever switch back to Responses API, ensure text.format includes *name*.
-        # Your logs showed missing text.format.name before. :contentReference[oaicite:1]{index=1}
         if DEBUG_LLM:
-            print("[DEBUG] OpenAI error:", repr(e))
+            print("[DEBUG] OPENAI ERROR:", repr(e))
         return None
 
-# ---------------- FLASK APP ----------------
 
-app = Flask(__name__)
+def ask_for_time(service_name: str):
+    return (
+        f"✍️ *{service_name}*\n\n"
+        "What day & time?\n"
+        "Examples:\n"
+        "• Tomorrow 2pm\n"
+        "• Mon 3:15pm\n"
+        "• 10/02 15:30\n\n"
+        "Reply *BACK* to change service."
+    )
 
+
+def offer_next_slots(service_name: str, duration_mins: int):
+    slots = next_available_slots(
+        CALENDAR_ID,
+        TZ,
+        duration_mins,
+        count=3,
+        step_mins=SLOT_STEP_MINUTES,
+        open_days=OPEN_DAYS,
+        open_time=OPEN_TIME,
+        close_time=CLOSE_TIME,
+    )
+    if not slots:
+        return "Sorry — no availability found. Try another day/time."
+
+    lines = [f"❌ That time is taken. Next available:"]
+    for dt in slots:
+        lines.append(f"• {dt.strftime('%a %d %b %H:%M')}")
+    lines.append("\nReply with one option (e.g. *Tomorrow 3pm*)")
+    return "\n".join(lines)
+
+
+# ---------------- ROUTES ----------------
 @app.get("/")
 def health():
     return "OK", 200
 
+
 @app.post("/whatsapp")
 def whatsapp():
     from_number = request.values.get("From", "")
-    body = normalize_text(request.values.get("Body", ""))
+    body = request.values.get("Body", "") or ""
+    text = body.strip()
 
     resp = MessagingResponse()
     msg = resp.message()
 
-    # Identify user
-    user_phone = from_number.replace("whatsapp:", "").strip() if from_number else "unknown"
+    phone = from_number.replace("whatsapp:", "").strip()
+    st = STATE.get(phone, {"step": "menu"})
+    STATE[phone] = st
 
-    # state init
-    st = user_state.get(user_phone) or {"step": "idle", "service": None, "dt": None}
-    user_state[user_phone] = st
+    tnorm = norm(text)
 
-    # global commands
-    low = body.lower()
-    if low in {"menu", "start", "hi", "hello"}:
-        st["step"] = "choose_service"
-        st["service"] = None
-        st["dt"] = None
+    # universal commands
+    if tnorm in {"menu", "start", "hi", "hello"}:
+        st["step"] = "menu"
         msg.body(menu_text())
         return str(resp)
 
-    if low == "back":
-        st["step"] = "choose_service"
-        st["service"] = None
-        st["dt"] = None
+    if tnorm == "back":
+        st["step"] = "menu"
+        st.pop("service", None)
+        st.pop("hold_until", None)
         msg.body(menu_text())
         return str(resp)
 
-    # ---------- LLM-first booking attempt (works even in the middle of flow) ----------
-    if looks_like_booking_text(body):
-        llm = call_openai_json(body)
-        if llm:
-            service_guess = pick_service_from_text(llm.get("service", "")) or pick_service_from_text(body)
-            dt_guess = parse_datetime(llm.get("datetime_text", "")) or parse_datetime(body)
+    # 1) LLM FIRST: if message looks like a full booking request and we are not mid-flow
+    if st.get("step") in {"menu", "idle"} and looks_like_booking_text(text):
+        data = call_openai_booking_extract(text)
+        if data:
+            svc = data.get("service")
+            dt_text = data.get("datetime_text")
 
-            if service_guess and dt_guess:
-                dur = service_duration(service_guess)
+            svc = get_service_by_choice(svc) if svc else None
+            if not svc:
+                # try to detect service from raw message
+                svc = get_service_by_choice(text)
 
-                if not within_open_hours(dt_guess, dur):
-                    msg.body("⏰ We’re open Mon–Sat 9am–6pm. Try a time within those hours.")
+            dt = parse_datetime_text(dt_text) if dt_text else None
+            if not dt:
+                # fallback: try parse whole message
+                dt = parse_datetime_text(text)
+
+            if svc and dt:
+                meta = service_meta(svc)
+                mins = meta["mins"]
+
+                # validate shop hours
+                if not within_open_hours(dt, mins):
+                    msg.body("That time is outside opening hours (Mon–Sat 9am–6pm). Try another time.")
                     return str(resp)
 
-                end_dt = dt_guess + timedelta(minutes=dur)
-                ok = is_time_available(CALENDAR_ID, dt_guess, end_dt)
-
-                if not ok:
-                    slots = next_available_slots(CALENDAR_ID, dt_guess, dur, step_minutes=SLOT_STEP_MINUTES, limit=3)
-                    if not slots:
-                        msg.body("❌ That time is taken, and I couldn’t find slots soon. Try another time.")
-                        return str(resp)
-
-                    lines = ["❌ That time is taken. Next available:"]
-                    for s in slots:
-                        lines.append(f"• {s.strftime('%a %d %b %H:%M')}")
-                    lines.append("\nReply with one option (e.g. Tomorrow 3pm)")
-                    st["step"] = "choose_time"
-                    st["service"] = service_guess
-                    st["dt"] = None
-                    msg.body("\n".join(lines))
+                # check availability
+                if not is_time_available(CALENDAR_ID, dt, mins, TZ):
+                    msg.body(offer_next_slots(svc, mins))
+                    st["step"] = "awaiting_slot_choice"
+                    st["service"] = svc
                     return str(resp)
 
                 # book it
+                end_dt = dt + timedelta(minutes=mins)
                 create_booking_event(
-                    CALENDAR_ID,
-                    start_dt=dt_guess,
+                    calendar_id=CALENDAR_ID,
+                    start_dt=dt,
                     end_dt=end_dt,
-                    service_name=service_guess,
-                    phone=user_phone,
+                    summary=f"{svc} - WhatsApp Booking",
+                    description=f"Booked via {BUSINESS_NAME}",
+                    phone=phone,  # safe now
+                    service_name=svc,
                 )
-                msg.body(f"✅ Booked: {service_guess}\n📅 {dt_guess.strftime('%a %d %b %H:%M')}")
                 st["step"] = "idle"
-                st["service"] = None
-                st["dt"] = None
+                msg.body(f"✅ Booked: *{svc}*\n📅 {dt.strftime('%a %d %b %H:%M')}")
                 return str(resp)
 
-    # ---------- Normal flow ----------
-    if st["step"] in {"idle", "choose_service"}:
-        # Try select service
-        service = pick_service_from_text(body)
-        if not service:
-            st["step"] = "choose_service"
+            # partial extraction -> drop into normal flow
+            if svc and not dt:
+                st["step"] = "awaiting_time"
+                st["service"] = svc
+                msg.body(ask_for_time(svc))
+                return str(resp)
+
+    # 2) NORMAL FLOW
+    if st.get("step") == "menu":
+        svc = get_service_by_choice(text)
+        if not svc:
             msg.body(menu_text())
             return str(resp)
 
-        st["service"] = service
-        st["step"] = "choose_time"
-        msg.body(
-            f"✍️ *{service}*\n\nWhat day & time?\nExamples:\n"
-            "• Tomorrow 2pm\n• Mon 3:15pm\n• 10/02 15:30\n\nReply BACK to change service."
-        )
+        st["service"] = svc
+        st["step"] = "awaiting_time"
+        msg.body(ask_for_time(svc))
         return str(resp)
 
-    if st["step"] == "choose_time":
-        service = st.get("service")
-        dur = service_duration(service)
+    if st.get("step") == "awaiting_time":
+        svc = st.get("service")
+        if not svc:
+            st["step"] = "menu"
+            msg.body(menu_text())
+            return str(resp)
 
-        dt = parse_datetime(body)
-
+        dt = parse_datetime_text(text)
         if not dt:
-            msg.body("I didn’t understand the time.\nTry:\n• Tomorrow 2pm\n• Mon 3:15pm\n• 10/02 15:30\n\nReply BACK to change service.")
+            msg.body("I didn’t understand the time.\nTry: Tomorrow 2pm / Mon 3:15pm / 10/02 15:30\n\nReply BACK to change service.")
             return str(resp)
 
-        if not within_open_hours(dt, dur):
-            msg.body("⏰ We’re open Mon–Sat 9am–6pm. Try a time within those hours.")
+        meta = service_meta(svc)
+        mins = meta["mins"]
+
+        if not within_open_hours(dt, mins):
+            msg.body("That time is outside opening hours (Mon–Sat 9am–6pm). Try another time.")
             return str(resp)
 
-        end_dt = dt + timedelta(minutes=dur)
-        ok = is_time_available(CALENDAR_ID, dt, end_dt)
-
-        if not ok:
-            slots = next_available_slots(CALENDAR_ID, dt, dur, step_minutes=SLOT_STEP_MINUTES, limit=3)
-            if not slots:
-                msg.body("❌ That time is taken. Try another time.")
-                return str(resp)
-
-            lines = ["❌ That time is taken. Next available:"]
-            for s in slots:
-                lines.append(f"• {s.strftime('%a %d %b %H:%M')}")
-            lines.append("\nReply with one option (e.g. Tomorrow 3pm)")
-            msg.body("\n".join(lines))
+        if not is_time_available(CALENDAR_ID, dt, mins, TZ):
+            msg.body(offer_next_slots(svc, mins))
+            st["step"] = "awaiting_slot_choice"
             return str(resp)
 
+        end_dt = dt + timedelta(minutes=mins)
         create_booking_event(
-            CALENDAR_ID,
+            calendar_id=CALENDAR_ID,
             start_dt=dt,
             end_dt=end_dt,
-            service_name=service,
-            phone=user_phone,
+            summary=f"{svc} - WhatsApp Booking",
+            description=f"Booked via {BUSINESS_NAME}",
+            phone=phone,
+            service_name=svc,
         )
-        msg.body(f"✅ Booked: {service}\n📅 {dt.strftime('%a %d %b %H:%M')}")
         st["step"] = "idle"
-        st["service"] = None
-        st["dt"] = None
+        msg.body(f"✅ Booked: *{svc}*\n📅 {dt.strftime('%a %d %b %H:%M')}")
+        return str(resp)
+
+    if st.get("step") == "awaiting_slot_choice":
+        svc = st.get("service")
+        if not svc:
+            st["step"] = "menu"
+            msg.body(menu_text())
+            return str(resp)
+
+        dt = parse_datetime_text(text)
+        if not dt:
+            msg.body("Reply with one of the offered options (e.g. Tomorrow 3pm).")
+            return str(resp)
+
+        meta = service_meta(svc)
+        mins = meta["mins"]
+
+        if not within_open_hours(dt, mins):
+            msg.body("That time is outside opening hours (Mon–Sat 9am–6pm). Try another time.")
+            return str(resp)
+
+        if not is_time_available(CALENDAR_ID, dt, mins, TZ):
+            msg.body(offer_next_slots(svc, mins))
+            return str(resp)
+
+        end_dt = dt + timedelta(minutes=mins)
+        create_booking_event(
+            calendar_id=CALENDAR_ID,
+            start_dt=dt,
+            end_dt=end_dt,
+            summary=f"{svc} - WhatsApp Booking",
+            description=f"Booked via {BUSINESS_NAME}",
+            phone=phone,
+            service_name=svc,
+        )
+        st["step"] = "idle"
+        msg.body(f"✅ Booked: *{svc}*\n📅 {dt.strftime('%a %d %b %H:%M')}")
         return str(resp)
 
     # fallback
+    st["step"] = "menu"
     msg.body(menu_text())
     return str(resp)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
