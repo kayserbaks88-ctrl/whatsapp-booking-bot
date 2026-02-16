@@ -23,6 +23,8 @@ def get_service():
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
+# ---------- HELPERS ----------
+
 def overlaps(a_start, a_end, b_start, b_end):
     return a_start < b_end and a_end > b_start
 
@@ -34,6 +36,10 @@ def _to_tz(dt: datetime, tz: ZoneInfo) -> datetime:
 # ---------- AVAILABILITY (FREEBUSY) ----------
 
 def get_busy_times(calendar_id: str, start: datetime, end: datetime, timezone: str):
+    """
+    Returns list of (busy_start, busy_end) in the requested timezone.
+    Uses FreeBusy which includes all events.
+    """
     service = get_service()
     tz = ZoneInfo(timezone)
 
@@ -64,7 +70,12 @@ def is_time_available(
     duration_minutes: int,
     timezone: str,
     buffer_minutes: int = 0,
+    ignore_interval=None,
 ):
+    """
+    Checks if [start_dt, start_dt+duration+buffer] overlaps any busy time.
+    ignore_interval: (old_start, old_end) to ignore clashes with the booking being rescheduled.
+    """
     tz = ZoneInfo(timezone)
     start_dt = _to_tz(start_dt, tz)
 
@@ -72,7 +83,15 @@ def is_time_available(
 
     busy = get_busy_times(calendar_id, start_dt, end_dt, timezone)
 
+    ign_s = ign_e = None
+    if ignore_interval:
+        ign_s = _to_tz(ignore_interval[0], tz)
+        ign_e = _to_tz(ignore_interval[1], tz)
+
     for bs, be in busy:
+        if ign_s and ign_e and bs == ign_s and be == ign_e:
+            continue
+
         if overlaps(start_dt, end_dt, bs, be):
             return False, f"Clashes with {bs.strftime('%H:%M')}–{be.strftime('%H:%M')}"
 
@@ -85,10 +104,15 @@ def next_available_slots(
     duration_minutes: int,
     timezone: str,
     step_minutes: int = 15,
-    count: int = 5,
+    max_results: int = 5,
     search_days: int = 7,
     buffer_minutes: int = 0,
 ):
+    """
+    Finds next available start times after from_dt.
+    NOTE: opening hours should be enforced in WhatsApp_bot.py;
+          this function only finds non-overlapping slots.
+    """
     tz = ZoneInfo(timezone)
     from_dt = _to_tz(from_dt, tz).replace(second=0, microsecond=0)
 
@@ -101,7 +125,7 @@ def next_available_slots(
     cursor = from_dt
     end_search = from_dt + timedelta(days=search_days)
 
-    while cursor < end_search and len(results) < count:
+    while cursor < end_search and len(results) < max_results:
         ok, _ = is_time_available(
             cursor,
             calendar_id,
@@ -111,6 +135,7 @@ def next_available_slots(
         )
         if ok:
             results.append(cursor)
+
         cursor += timedelta(minutes=step_minutes)
 
     return results
@@ -120,19 +145,29 @@ def next_available_slots(
 
 def create_booking_event(
     calendar_id: str,
+    service_name: str,
+    customer_name: str,
     start_dt: datetime,
     duration_minutes: int,
-    title: str,
-    description: str,
-    timezone: str,
+    phone: str = "",
+    timezone: str = "Europe/London",
+    **_ignored_kwargs,  # IMPORTANT: keeps compatibility even if caller passes extra args
 ):
+    """
+    Create booking event.
+    Accepts phone (and ignores any unexpected kwargs) to prevent deployment mismatch errors.
+    """
     tz = ZoneInfo(timezone)
     start_dt = _to_tz(start_dt, tz)
     end_dt = start_dt + timedelta(minutes=duration_minutes)
 
+    desc_lines = [f"Customer: {customer_name}"]
+    if phone:
+        desc_lines.append(f"Phone: {phone}")
+
     body = {
-        "summary": title,
-        "description": description,
+        "summary": f"{service_name} — {customer_name}",
+        "description": "\n".join(desc_lines),
         "start": {"dateTime": start_dt.isoformat(), "timeZone": timezone},
         "end": {"dateTime": end_dt.isoformat(), "timeZone": timezone},
     }
@@ -140,7 +175,7 @@ def create_booking_event(
     service = get_service()
     event = service.events().insert(calendarId=calendar_id, body=body).execute()
 
-    return event.get("id"), event.get("htmlLink")
+    return {"event_id": event.get("id"), "html_link": event.get("htmlLink")}
 
 
 def delete_booking_event(calendar_id: str, event_id: str):
