@@ -294,7 +294,16 @@ def ask_time_text(service: str) -> str:
     )
 
 # ---------------- LLM (Assist only) ----------------
-client = OpenAI(api_key=OPENAI_API_KEY) if (USE_LLM and OPENAI_API_KEY) else None
+# IMPORTANT: LLM must NEVER be allowed to crash the webhook.
+# If OpenAI fails (timeout/network/key), we just fall back to deterministic parsing.
+
+client = None
+if USE_LLM and OPENAI_API_KEY:
+    try:
+        # Set timeout at client-level (Render-safe)
+        client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT)
+    except Exception:
+        client = None
 
 def llm_extract(text: str) -> dict:
     """
@@ -313,18 +322,22 @@ def llm_extract(text: str) -> dict:
         "If user message is only a number, service should be null.\n"
     )
 
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        input=[
-            {"role": "system", "content": sys},
-            {"role": "user", "content": text},
-        ],
-        temperature=0,
-        max_output_tokens=120,
-        timeout=OPENAI_TIMEOUT,
-    )
+    try:
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+            max_output_tokens=120,
+        )
+    except Exception as e:
+        # Render will log this, but WhatsApp won't break
+        print("LLM_ERROR:", repr(e))
+        return {"service": None, "datetime_text": None}
 
-    out = (resp.output_text or "").strip()
+    out = (getattr(resp, "output_text", "") or "").strip()
     out = out.strip("` \n")
     out = re.sub(r"^json\s*", "", out.strip(), flags=re.I)
 
@@ -341,13 +354,12 @@ def llm_extract(text: str) -> dict:
         service = None
 
     if isinstance(dt_text, str):
-        dt_text = dt_text.strip()
-        if not dt_text:
-            dt_text = None
+        dt_text = dt_text.strip() or None
     else:
         dt_text = None
 
     return {"service": service, "datetime_text": dt_text}
+
 
 # ---------------- APP ----------------
 app = Flask(__name__)
@@ -385,6 +397,8 @@ def whatsapp():
 
     # LLM assist (safe)
     llm = llm_extract(body) if USE_LLM else {"service": None, "datetime_text": None}
+    # (llm_extract already cannot crash now)
+
 
     # ---------------- STEP: MENU ----------------
     if step == "menu":
