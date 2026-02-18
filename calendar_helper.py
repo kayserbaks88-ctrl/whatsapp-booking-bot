@@ -5,96 +5,62 @@ from zoneinfo import ZoneInfo
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+TIMEZONE = os.getenv("TIMEZONE_HINT", "Europe/London")
+TZ = ZoneInfo(TIMEZONE)
+
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 def _get_service():
-    """
-    Uses GOOGLE_CREDENTIALS_JSON (a JSON string) from env.
-    """
+    # Use ONE of these in env:
+    # GOOGLE_CREDENTIALS_JSON = full JSON string
+    # OR GOOGLE_APPLICATION_CREDENTIALS = path to json file
     creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
-    if not creds_json:
-        raise RuntimeError("Missing GOOGLE_CREDENTIALS_JSON env var")
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 
-    import json
-    info = json.loads(creds_json)
+    if creds_json:
+        import json
+        info = json.loads(creds_json)
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    else:
+        if not creds_path:
+            raise RuntimeError("Missing GOOGLE_CREDENTIALS_JSON or GOOGLE_APPLICATION_CREDENTIALS")
+        creds = service_account.Credentials.from_service_account_file(creds_path, scopes=SCOPES)
 
-    creds = service_account.Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/calendar"],
-    )
-    return build("calendar", "v3", credentials=creds)
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
-
-def _to_rfc3339(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        raise ValueError("datetime must be timezone-aware")
-    return dt.isoformat()
-
-
-def is_time_available(calendar_id: str, start_dt: datetime, end_dt: datetime) -> bool:
+def is_time_available(calendar_id: str, start_dt: datetime, minutes: int) -> bool:
     svc = _get_service()
+    end_dt = start_dt + timedelta(minutes=minutes)
+
     body = {
-        "timeMin": _to_rfc3339(start_dt),
-        "timeMax": _to_rfc3339(end_dt),
+        "timeMin": start_dt.isoformat(),
+        "timeMax": end_dt.isoformat(),
+        "timeZone": str(TZ),
         "items": [{"id": calendar_id}],
     }
-    res = svc.freebusy().query(body=body).execute()
-    busy = res.get("calendars", {}).get(calendar_id, {}).get("busy", [])
+    fb = svc.freebusy().query(body=body).execute()
+    busy = fb["calendars"][calendar_id].get("busy", [])
     return len(busy) == 0
 
-
-def next_available_slots(
-    calendar_id: str,
-    day_start: datetime,
-    day_end: datetime,
-    duration_minutes: int,
-    step_minutes: int = 15,
-    limit: int = 3,
-):
-    """
-    Returns list[datetime] start times for next available slots within [day_start, day_end].
-    """
+def next_available_slots(calendar_id: str, minutes: int, start_from: datetime, tz: ZoneInfo, step_mins: int = 15, limit: int = 3):
     slots = []
-    cursor = day_start
+    cur = start_from.astimezone(tz).replace(second=0, microsecond=0)
 
-    while cursor + timedelta(minutes=duration_minutes) <= day_end:
-        end = cursor + timedelta(minutes=duration_minutes)
-        if is_time_available(calendar_id, cursor, end):
-            slots.append(cursor)
+    # check up to ~7 days ahead
+    for _ in range(int((7 * 24 * 60) / step_mins)):
+        if is_time_available(calendar_id, cur, minutes):
+            slots.append(cur)
             if len(slots) >= limit:
                 break
-        cursor += timedelta(minutes=step_minutes)
-
+        cur = cur + timedelta(minutes=step_mins)
     return slots
 
-
-def create_booking_event(
-    calendar_id: str,
-    start_dt: datetime,
-    end_dt: datetime,
-    summary: str,
-    description: str = "",
-    phone: str | None = None,
-    service_name: str | None = None,
-):
-    """
-    phone/service_name are OPTIONAL, so WhatsApp_bot can pass them safely.
-    """
+def create_booking_event(calendar_id: str, start_dt: datetime, end_dt: datetime, summary: str, description: str, phone: str, service_name: str):
     svc = _get_service()
-
-    desc_lines = []
-    if description:
-        desc_lines.append(description)
-    if service_name:
-        desc_lines.append(f"Service: {service_name}")
-    if phone:
-        desc_lines.append(f"Customer: {phone}")
-
     event = {
         "summary": summary,
-        "description": "\n".join(desc_lines).strip(),
-        "start": {"dateTime": _to_rfc3339(start_dt)},
-        "end": {"dateTime": _to_rfc3339(end_dt)},
+        "description": f"{description}\nPhone: {phone}\nService: {service_name}",
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": str(TZ)},
+        "end": {"dateTime": end_dt.isoformat(), "timeZone": str(TZ)},
     }
-
-    created = svc.events().insert(calendarId=calendar_id, body=event).execute()
-    return created
+    return svc.events().insert(calendarId=calendar_id, body=event).execute()
