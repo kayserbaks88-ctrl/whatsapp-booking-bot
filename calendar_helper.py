@@ -2,155 +2,152 @@ import os
 import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from typing import List, Optional, Tuple
 
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from google.oauth2.service_account import Credentials
-
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 
-def get_service():
-    raw = os.getenv("GOOGLE_CREDENTIALS_JSON")
-    if not raw:
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON not set in Render env")
+def _get_tz() -> ZoneInfo:
+    tz_name = os.getenv("TIMEZONE_HINT", "Europe/London")
+    return ZoneInfo(tz_name)
 
-    try:
-        creds_info = json.loads(raw)
-    except Exception as e:
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON is not valid JSON: " + str(e))
 
-    creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+def _get_calendar_id() -> str:
+    return os.getenv("GOOGLE_CALENDAR_ID", "primary")
+
+
+def _load_service_account_info() -> dict:
+    """
+    Supports either:
+      - GOOGLE_CREDENTIALS_JSON (full JSON string)
+      - GOOGLE_CREDENTIALS_FILE (path to json file)
+      - credentials.json in project root (fallback)
+    """
+    raw = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+    if raw:
+        # It might be a JSON string
+        return json.loads(raw)
+
+    path = os.getenv("GOOGLE_CREDENTIALS_FILE", "").strip()
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    # fallback
+    if os.path.exists("credentials.json"):
+        with open("credentials.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    raise RuntimeError(
+        "Google credentials missing. Set GOOGLE_CREDENTIALS_JSON or GOOGLE_CREDENTIALS_FILE "
+        "or add credentials.json."
+    )
+
+
+def _get_service():
+    info = _load_service_account_info()
+    scopes = ["https://www.googleapis.com/auth/calendar"]
+    creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
-def overlaps(a_start, a_end, b_start, b_end):
-    return a_start < b_end and a_end > b_start
+def _to_rfc3339(dt: datetime) -> str:
+    # Ensure tz-aware
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_get_tz())
+    return dt.isoformat()
 
 
-def _to_tz(dt: datetime, tz: ZoneInfo) -> datetime:
-    return dt.astimezone(tz) if dt.tzinfo else dt.replace(tzinfo=tz)
+def list_events_between(calendar_id: str, start_dt: datetime, end_dt: datetime) -> list:
+    svc = _get_service()
+    resp = svc.events().list(
+        calendarId=calendar_id,
+        timeMin=_to_rfc3339(start_dt),
+        timeMax=_to_rfc3339(end_dt),
+        singleEvents=True,
+        orderBy="startTime",
+        maxResults=250,
+    ).execute()
+    return resp.get("items", [])
 
 
-def get_busy_times(calendar_id: str, start: datetime, end: datetime, timezone: str):
-    """
-    Returns list of (busy_start, busy_end) in the requested timezone.
-    Uses FreeBusy which includes all events.
-    """
-    service = get_service()
-    tz = ZoneInfo(timezone)
-
-    start = _to_tz(start, tz)
-    end = _to_tz(end, tz)
-
-    body = {
-        "timeMin": start.isoformat(),
-        "timeMax": end.isoformat(),
-        "items": [{"id": calendar_id}],
-    }
-
-    result = service.freebusy().query(body=body).execute()
-    busy = result["calendars"].get(calendar_id, {}).get("busy", [])
-
-    intervals = []
-    for b in busy:
-        bs = datetime.fromisoformat(b["start"].replace("Z", "+00:00")).astimezone(tz)
-        be = datetime.fromisoformat(b["end"].replace("Z", "+00:00")).astimezone(tz)
-        intervals.append((bs, be))
-
-    return intervals
+def has_overlap(start_a: datetime, end_a: datetime, start_b: datetime, end_b: datetime) -> bool:
+    return start_a < end_b and start_b < end_a
 
 
-def is_time_available(
-    start_dt: datetime,
-    calendar_id: str,
-    duration_minutes: int,
-    timezone: str,
-    buffer_minutes: int = 0,
-):
-    """
-    Checks if [start_dt, start_dt+duration+buffer] overlaps any busy time.
-    """
-    tz = ZoneInfo(timezone)
-    start_dt = _to_tz(start_dt, tz)
-    end_dt = start_dt + timedelta(minutes=duration_minutes + max(0, buffer_minutes))
+def is_time_available(start_dt: datetime, minutes: int, calendar_id: Optional[str] = None) -> bool:
+    cal_id = calendar_id or _get_calendar_id()
+    end_dt = start_dt + timedelta(minutes=minutes)
+    events = list_events_between(cal_id, start_dt - timedelta(minutes=1), end_dt + timedelta(minutes=1))
 
-    busy = get_busy_times(calendar_id, start_dt, end_dt, timezone)
+    for ev in events:
+        s = ev.get("start", {}).get("dateTime")
+        e = ev.get("end", {}).get("dateTime")
+        if not s or not e:
+            continue
+        sdt = datetime.fromisoformat(s)
+        edt = datetime.fromisoformat(e)
+        if has_overlap(start_dt, end_dt, sdt, edt):
+            return False
 
-    for bs, be in busy:
-        if overlaps(start_dt, end_dt, bs, be):
-            return False, f"Clashes with {bs.strftime('%H:%M')}–{be.strftime('%H:%M')}"
-
-    return True, "OK"
+    return True
 
 
 def next_available_slots(
-    from_dt: datetime,
-    calendar_id: str,
-    duration_minutes: int,
-    timezone: str,
-    step_minutes: int = 15,
-    count: int = 5,
-    search_days: int = 7,
-    buffer_minutes: int = 0,
-):
+    desired_dt: datetime,
+    minutes: int,
+    slot_step_minutes: int = 15,
+    max_slots: int = 3,
+    search_hours_ahead: int = 24,
+    calendar_id: Optional[str] = None,
+) -> List[datetime]:
     """
-    Finds next available start times after from_dt.
-    NOTE: opening hours enforced in WhatsApp_bot.py
+    Find next available slots starting at/after desired_dt, stepping by slot_step_minutes.
+    Searches up to search_hours_ahead hours ahead.
     """
-    tz = ZoneInfo(timezone)
-    from_dt = _to_tz(from_dt, tz).replace(second=0, microsecond=0)
+    cal_id = calendar_id or _get_calendar_id()
+    slots: List[datetime] = []
+    tz = _get_tz()
 
-    mod = from_dt.minute % step_minutes
-    if mod != 0:
-        from_dt = from_dt + timedelta(minutes=(step_minutes - mod))
-        from_dt = from_dt.replace(second=0, microsecond=0)
+    cursor = desired_dt
+    if cursor.tzinfo is None:
+        cursor = cursor.replace(tzinfo=tz)
 
-    results = []
-    cursor = from_dt
-    end_search = from_dt + timedelta(days=search_days)
+    end_search = cursor + timedelta(hours=search_hours_ahead)
+    while cursor <= end_search and len(slots) < max_slots:
+        if is_time_available(cursor, minutes, calendar_id=cal_id):
+            slots.append(cursor)
+        cursor = cursor + timedelta(minutes=slot_step_minutes)
 
-    while cursor < end_search and len(results) < count:
-        ok, _ = is_time_available(
-            cursor,
-            calendar_id,
-            duration_minutes,
-            timezone,
-            buffer_minutes=buffer_minutes,
-        )
-        if ok:
-            results.append(cursor)
-
-        cursor += timedelta(minutes=step_minutes)
-
-    return results
+    return slots
 
 
 def create_booking_event(
-    calendar_id: str,
     start_dt: datetime,
-    duration_minutes: int,
-    title: str,
+    end_dt: datetime,
+    summary: str,
     description: str,
-    timezone: str,
-):
-    tz = ZoneInfo(timezone)
-    start_dt = _to_tz(start_dt, tz)
-    end_dt = start_dt + timedelta(minutes=duration_minutes)
+    from_number: str,
+    service_name: str,
+    calendar_id: Optional[str] = None,
+) -> str:
+    cal_id = calendar_id or _get_calendar_id()
+    svc = _get_service()
 
-    body = {
-        "summary": title,
+    event_body = {
+        "summary": summary,
         "description": description,
-        "start": {"dateTime": start_dt.isoformat(), "timeZone": timezone},
-        "end": {"dateTime": end_dt.isoformat(), "timeZone": timezone},
+        "start": {"dateTime": _to_rfc3339(start_dt)},
+        "end": {"dateTime": _to_rfc3339(end_dt)},
+        "extendedProperties": {
+            "private": {
+                "from_number": from_number,
+                "service": service_name,
+                "source": "trimtech_whatsapp",
+            }
+        },
     }
 
-    service = get_service()
-    event = service.events().insert(calendarId=calendar_id, body=body).execute()
-
-    return event.get("id"), event.get("htmlLink")
-
-
-def delete_booking_event(calendar_id: str, event_id: str):
-    service = get_service()
-    service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
-    return True
+    created = svc.events().insert(calendarId=cal_id, body=event_body).execute()
+    return created.get("id", "")
