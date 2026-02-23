@@ -1,32 +1,46 @@
 import os
+import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 
-# Timezone (must match your bot config)
 TIMEZONE = os.getenv("TIMEZONE_HINT", "Europe/London")
 TZ = ZoneInfo(TIMEZONE)
 
-# Google Calendar scopes
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 
 def _get_calendar_service():
     """
-    Build Google Calendar service using a service account JSON key file.
-
-    Env vars:
-      GOOGLE_SERVICE_ACCOUNT_FILE = path to your service account JSON
-        e.g. "credentials.json" (local)
-        e.g. "/opt/render/project/src/credentials.json" (Render)
+    Build Google Calendar service using either:
+    1) GOOGLE_CREDENTIALS_JSON (raw JSON in env), or
+    2) GOOGLE_SERVICE_ACCOUNT_FILE (path to JSON file), or
+    3) 'credentials.json' in project root.
     """
+    json_env = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    if json_env:
+        # Load credentials directly from env JSON
+        try:
+            info = json.loads(json_env)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                "GOOGLE_CREDENTIALS_JSON is set but is not valid JSON"
+            ) from e
+
+        credentials = service_account.Credentials.from_service_account_info(
+            info, scopes=SCOPES
+        )
+        return build("calendar", "v3", credentials=credentials)
+
+    # Fallback: use file path
     creds_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "credentials.json")
     if not os.path.exists(creds_path):
         raise FileNotFoundError(
             f"Google service account file not found at {creds_path}. "
-            f"Set GOOGLE_SERVICE_ACCOUNT_FILE or place credentials.json in project root."
+            f"Set GOOGLE_SERVICE_ACCOUNT_FILE, or set GOOGLE_CREDENTIALS_JSON, "
+            f"or place credentials.json in project root."
         )
 
     credentials = service_account.Credentials.from_service_account_file(
@@ -34,6 +48,7 @@ def _get_calendar_service():
     )
     service = build("calendar", "v3", credentials=credentials)
     return service
+
 
 
 def list_user_bookings(calendar_id: str, user_phone: str, limit: int = 10):
