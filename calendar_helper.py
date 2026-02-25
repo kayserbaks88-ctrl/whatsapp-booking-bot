@@ -3,210 +3,131 @@ import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from googleapiclient.discovery import build
 from google.oauth2 import service_account
-
-TIMEZONE = os.getenv("TIMEZONE_HINT", "Europe/London")
-TZ = ZoneInfo(TIMEZONE)
-
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
-CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+from googleapiclient.discovery import build
 
 
 def _get_calendar_service():
-    """
-    Build Google Calendar service using either:
-    1) GOOGLE_CREDENTIALS_JSON (raw JSON in env), or
-    2) GOOGLE_CREDENTIALS_FILE (path to JSON file), or
-    3) 'credentials.json' in project root.
-    """
-    json_env = os.getenv("GOOGLE_CREDENTIALS_JSON")
-    if json_env:
-        try:
-            info = json.loads(json_env)
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                "GOOGLE_CREDENTIALS_JSON is set but is not valid JSON"
-            ) from e
+    creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+    if not creds_json:
+        raise RuntimeError("Missing GOOGLE_CREDENTIALS_JSON env var")
 
-        credentials = service_account.Credentials.from_service_account_info(
-            info, scopes=SCOPES
-        )
-        return build("calendar", "v3", credentials=credentials)
-
-    # Fallback: use file path
-    creds_path = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
-    credentials = service_account.Credentials.from_service_account_file(
-        creds_path, scopes=SCOPES
-    )
-    return build("calendar", "v3", credentials=credentials)
+    info = json.loads(creds_json)
+    scopes = ["https://www.googleapis.com/auth/calendar"]
+    creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
-def _phone_tag(phone: str) -> str:
-    # Tag we put in description so we can filter events by WhatsApp number
-    return f"[WA:{phone}]"
-
-
-def add_booking(phone: str, service_name: str, start_dt: datetime, minutes: int):
-    """
-    Create a booking event in Google Calendar and return:
-    { "id": eventId, "service": str, "start": datetime, "minutes": int }
-    """
+def is_time_available(calendar_id: str, start_dt: datetime, duration_minutes: int, tz: ZoneInfo, ignore_event_id: str = None) -> bool:
     service = _get_calendar_service()
-    start_dt = start_dt.astimezone(TZ)
-    end_dt = start_dt + timedelta(minutes=minutes)
+    end_dt = start_dt + timedelta(minutes=duration_minutes)
 
-    event = {
-        "summary": service_name,
-        "description": f"{_phone_tag(phone)} WhatsApp booking",
-        "start": {"dateTime": start_dt.isoformat(), "timeZone": str(TZ)},
-        "end": {"dateTime": end_dt.isoformat(), "timeZone": str(TZ)},
+    events = service.events().list(
+        calendarId=calendar_id,
+        timeMin=start_dt.astimezone(tz).isoformat(),
+        timeMax=end_dt.astimezone(tz).isoformat(),
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
+
+    for ev in events.get("items", []):
+        if ignore_event_id and ev.get("id") == ignore_event_id:
+            continue
+        # any overlap means not available (timeMin/timeMax window already restricts)
+        return False
+
+    return True
+
+
+def next_available_slots(calendar_id: str, desired_dt: datetime, duration_minutes: int, tz: ZoneInfo, limit: int = 3, step_minutes: int = 15):
+    slots = []
+    probe = desired_dt
+
+    # look forward up to ~7 days max
+    for _ in range(int((7 * 24 * 60) / step_minutes)):
+        if is_time_available(calendar_id, probe, duration_minutes, tz):
+            slots.append(probe)
+            if len(slots) >= limit:
+                break
+        probe = probe + timedelta(minutes=step_minutes)
+
+    return slots
+
+
+def create_booking_event(calendar_id: str, from_number: str, service_name: str, start_dt: datetime, duration_minutes: int, tz: ZoneInfo, shop_name: str):
+    service = _get_calendar_service()
+    end_dt = start_dt + timedelta(minutes=duration_minutes)
+
+    # Tag WhatsApp number in description for filtering
+    description = f"Booking via WhatsApp\nCustomer: {from_number}\nService: {service_name}"
+
+    body = {
+        "summary": f"{service_name} ({from_number})",
+        "description": description,
+        "start": {"dateTime": start_dt.astimezone(tz).isoformat(), "timeZone": str(tz)},
+        "end": {"dateTime": end_dt.astimezone(tz).isoformat(), "timeZone": str(tz)},
+        "location": shop_name,
     }
 
-    created = (
-        service.events()
-        .insert(calendarId=CALENDAR_ID, body=event)
-        .execute()
-    )
+    created = service.events().insert(calendarId=calendar_id, body=body).execute()
 
     return {
-        "id": created["id"],
-        "service": service_name,
-        "start": start_dt,
-        "minutes": minutes,
+        "event_id": created.get("id"),
+        "htmlLink": created.get("htmlLink"),
     }
 
 
-def list_bookings(phone: str, limit: int = 10):
-    """
-    List upcoming bookings for this phone.
-    Returns list of {id, service, start}.
-    """
+def list_upcoming_bookings_for_number(calendar_id: str, from_number: str, tz: ZoneInfo, limit: int = 10):
     service = _get_calendar_service()
-    now = datetime.now(TZ).isoformat()
-    events_result = (
-        service.events()
-        .list(
-            calendarId=CALENDAR_ID,
-            timeMin=now,
-            maxResults=50,
-            singleEvents=True,
-            orderBy="startTime",
-        )
-        .execute()
-    )
-    events = events_result.get("items", [])
+    now = datetime.now(tz)
 
-    tag = _phone_tag(phone)
-    bookings = []
+    events = service.events().list(
+        calendarId=calendar_id,
+        timeMin=now.isoformat(),
+        maxResults=50,
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
 
-    for e in events:
-        desc = e.get("description", "") or ""
-        if tag not in desc:
+    results = []
+    for ev in events.get("items", []):
+        desc = (ev.get("description") or "")
+        if from_number not in desc and from_number not in (ev.get("summary") or ""):
             continue
 
-        start_str = e["start"].get("dateTime") or e["start"].get("date")
-        if "T" in start_str:
-            start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-        else:
-            # All-day fallback: assume 9am
-            start_dt = datetime.fromisoformat(start_str + "T09:00:00")
+        start_str = ev["start"].get("dateTime")
+        if not start_str:
+            continue
+        start_dt = datetime.fromisoformat(start_str).astimezone(tz)
 
-        if start_dt.tzinfo is None:
-            start_dt = start_dt.replace(tzinfo=TZ)
-        start_dt = start_dt.astimezone(TZ)
+        # service name from summary before "("
+        summary = ev.get("summary") or ""
+        service_name = summary.split("(")[0].strip() if summary else "Booking"
 
-        bookings.append(
-            {
-                "id": e["id"],
-                "service": e.get("summary", "Booking"),
-                "start": start_dt,
-            }
-        )
+        results.append({
+            "event_id": ev.get("id"),
+            "service": service_name,
+            "start": start_dt,
+            "htmlLink": ev.get("htmlLink"),
+        })
 
-    bookings.sort(key=lambda b: b["start"])
-    return bookings[:limit]
+    # sort and limit
+    results.sort(key=lambda x: x["start"])
+    return results[:limit]
 
 
-def cancel_booking(phone: str, booking_id: str):
-    """
-    Delete a booking by Google eventId.
-    Returns deleted booking info or None if not found.
-    """
+def delete_booking_event(calendar_id: str, event_id: str):
     service = _get_calendar_service()
-    try:
-        event = service.events().get(calendarId=CALENDAR_ID, eventId=booking_id).execute()
-    except Exception:
-        return None
-
-    service.events().delete(calendarId=CALENDAR_ID, eventId=booking_id).execute()
-
-    start_str = event["start"].get("dateTime") or event["start"].get("date")
-    if "T" in start_str:
-        start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-    else:
-        start_dt = datetime.fromisoformat(start_str + "T09:00:00")
-
-    if start_dt.tzinfo is None:
-        start_dt = start_dt.replace(tzinfo=TZ)
-    start_dt = start_dt.astimezone(TZ)
-
-    return {
-        "id": booking_id,
-        "service": event.get("summary", "Booking"),
-        "start": start_dt,
-    }
+    service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
 
 
-def reschedule_booking(phone: str, booking_id: str, new_start: datetime):
-    """
-    Move an existing booking to a new time, keep same duration.
-    """
+def reschedule_booking_event(calendar_id: str, event_id: str, new_start_dt: datetime, duration_minutes: int, tz: ZoneInfo):
     service = _get_calendar_service()
-    new_start = new_start.astimezone(TZ)
+    ev = service.events().get(calendarId=calendar_id, eventId=event_id).execute()
 
-    event = service.events().get(calendarId=CALENDAR_ID, eventId=booking_id).execute()
+    new_end_dt = new_start_dt + timedelta(minutes=duration_minutes)
+    ev["start"] = {"dateTime": new_start_dt.astimezone(tz).isoformat(), "timeZone": str(tz)}
+    ev["end"] = {"dateTime": new_end_dt.astimezone(tz).isoformat(), "timeZone": str(tz)}
 
-    # Compute old duration
-    old_start_str = event["start"].get("dateTime") or event["start"].get("date")
-    old_end_str = event["end"].get("dateTime") or event["end"].get("date")
-    if "T" in old_start_str:
-        old_start_dt = datetime.fromisoformat(old_start_str.replace("Z", "+00:00"))
-    else:
-        old_start_dt = datetime.fromisoformat(old_start_str + "T09:00:00")
-    if "T" in old_end_str:
-        old_end_dt = datetime.fromisoformat(old_end_str.replace("Z", "+00:00"))
-    else:
-        old_end_dt = datetime.fromisoformat(old_end_str + "T09:00:00")
-
-    minutes = int((old_end_dt - old_start_dt).total_seconds() // 60)
-
-    new_end = new_start + timedelta(minutes=minutes)
-
-    event["start"] = {"dateTime": new_start.isoformat(), "timeZone": str(TZ)}
-    event["end"] = {"dateTime": new_end.isoformat(), "timeZone": str(TZ)}
-
-    updated = (
-        service.events()
-        .update(calendarId=CALENDAR_ID, eventId=booking_id, body=event)
-        .execute()
-    )
-
-    return {
-        "id": booking_id,
-        "service": updated.get("summary", "Booking"),
-        "start": new_start,
-        "minutes": minutes,
-    }
-
-
-def find_next_booking(phone: str):
-    """
-    Return the next upcoming booking for this phone, or None.
-    """
-    bs = list_bookings(phone, limit=50)
-    now = datetime.now(TZ)
-    future = [b for b in bs if b["start"] >= now]
-    if not future:
-        return None
-    return future[0]
+    updated = service.events().update(calendarId=calendar_id, eventId=event_id, body=ev).execute()
+    return updated
