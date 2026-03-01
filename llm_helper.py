@@ -1,151 +1,128 @@
 import os
+import json
 import re
+import urllib.request
 
-# Optional OpenAI (won't crash if not installed)
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-
-def _clean(text: str) -> str:
-    return (text or "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "30"))
+DEBUG_LLM = os.getenv("DEBUG_LLM", "0").strip() == "1"
 
 
-def _norm(text: str) -> str:
-    return re.sub(r"\s+", " ", _clean(text)).strip().lower()
+def _post_json(url: str, payload: dict, timeout: int):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {OPENAI_API_KEY}")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
-def _guess_service(text: str, service_names: list[str]) -> str | None:
-    t = _norm(text)
-    if not t:
-        return None
-
-    # quick aliases you mentioned
-    aliases = {
-        "trim": "Haircut",
-        "kids cut": "Children's Cut",
-        "kid cut": "Children's Cut",
-        "childrens cut": "Children's Cut",
-        "children cut": "Children's Cut",
-        "boys cut": "Boy's Cut",
-        "boy cut": "Boy's Cut",
-        "beard": "Beard Trim",
-        "skin fade": "Skin Fade",
-        "fade": "Skin Fade",
-        "shape": "Shape Up",
-        "hot towel": "Hot Towel Shave",
-        "ear wax": "Ear Waxing",
-        "nose wax": "Nose Waxing",
-        "eyebrow": "Eyebrow Trim",
-    }
-    for k, v in aliases.items():
-        if k in t:
-            return v
-
-    # exact/contains match to your menu names
-    best = None
-    for name in service_names:
-        n = name.lower()
-        if n in t:
-            best = name
-            break
-    return best
-
-
-def _extract_booking_index(text: str) -> int | None:
-    m = re.search(r"\b(\d{1,2})\b", _norm(text))
+def _safe_json_extract(text: str):
+    # try to find a JSON object in any text
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not m:
         return None
     try:
-        return int(m.group(1))
+        return json.loads(m.group(0))
     except Exception:
         return None
 
 
-def llm_extract(user_text: str, service_names: list[str]) -> dict | None:
+def llm_extract(user_text: str, service_names: list[str]):
     """
     Returns dict like:
-      {"intent": "book"|"menu"|"view"|"cancel"|"reschedule", "service": "...", "when_text": "...", "booking_index": 1}
-    or None if no confident intent.
+    {
+      "intent": "book|menu|view|cancel|reschedule|unknown",
+      "service": "Haircut" (optional),
+      "when_text": "Friday 2pm" (optional),
+      "booking_index": 1 (optional int)
+    }
     """
-    text = _clean(user_text)
-    t = _norm(text)
-    if not t:
+    if not OPENAI_API_KEY:
         return None
 
-    # RULES FIRST (fast + reliable)
-    if t in {"menu", "help"}:
-        return {"intent": "menu"}
+    prompt = f"""
+You are an assistant for a barbershop WhatsApp booking bot.
 
-    if t in {"my bookings", "mybookings", "bookings", "view"}:
-        return {"intent": "view"}
+Extract intent + details from the user's message.
 
-    if t.startswith("cancel"):
-        idx = _extract_booking_index(t) or 1
-        return {"intent": "cancel", "booking_index": idx}
+Allowed intents:
+- "menu" (show services)
+- "view" (my bookings)
+- "cancel"
+- "reschedule"
+- "book"
+- "unknown"
 
-    if t.startswith("reschedule"):
-        idx = _extract_booking_index(t) or 1
-        return {"intent": "reschedule", "booking_index": idx}
+Services list (match EXACTLY if possible):
+{service_names}
 
-    # booking style phrases
-    book_words = ("book", "can i book", "can i get", "i want", "i need", "get me", "appointment")
-    if any(w in t for w in book_words):
-        svc = _guess_service(t, service_names)
-        # Try to grab "when" part roughly: after service word or after "book"
-        when_text = ""
-        m = re.search(r"\b(book|appointment)\b(.+)$", t)
-        if m:
-            when_text = m.group(2).strip()
-        return {"intent": "book", "service": svc or "", "when_text": when_text}
+Rules:
+- If user says "my bookings", "view", "see bookings" => intent=view
+- If user says cancel booking # => intent=cancel and booking_index
+- If user says reschedule booking # => intent=reschedule and booking_index
+- If user is trying to book and mentions a service + time/day => intent=book, include "service" and "when_text"
+- If user says "trim" assume Haircut.
+- If unsure, intent=unknown.
 
-    # OPTIONAL: OpenAI fallback (only if installed + key set)
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
-    timeout = float(os.getenv("OPENAI_TIMEOUT", "20").strip() or "20")
+Return ONLY valid JSON, no extra text.
+JSON schema:
+{{
+  "intent": "menu|view|cancel|reschedule|book|unknown",
+  "service": "string or empty",
+  "when_text": "string or empty",
+  "booking_index": 0
+}}
 
-    if not api_key or OpenAI is None:
-        return None
+User message:
+{user_text}
+""".strip()
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": prompt,
+        "max_output_tokens": 200,
+    }
 
     try:
-        client = OpenAI(api_key=api_key, timeout=timeout)
+        # OpenAI Responses API
+        data = _post_json("https://api.openai.com/v1/responses", payload, timeout=OPENAI_TIMEOUT)
 
-        system = (
-            "You extract intent from WhatsApp barber booking messages.\n"
-            "Return ONLY strict JSON, no markdown.\n"
-            "Schema:\n"
-            "{"
-            '"intent":"menu|view|cancel|reschedule|book|none",'
-            '"service":"",'
-            '"when_text":"",'
-            '"booking_index":1'
-            "}\n"
-            "If unknown, intent=none."
-        )
+        # responses output text can appear in different shapes; grab any text fields
+        text_chunks = []
 
-        user = (
-            f"Services: {service_names}\n"
-            f"Message: {text}"
-        )
+        if isinstance(data, dict):
+            if "output" in data and isinstance(data["output"], list):
+                for item in data["output"]:
+                    content = item.get("content") if isinstance(item, dict) else None
+                    if isinstance(content, list):
+                        for c in content:
+                            if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
+                                text_chunks.append(c.get("text", ""))
+            if "output_text" in data and isinstance(data["output_text"], str):
+                text_chunks.append(data["output_text"])
 
-        r = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
+        combined = "\n".join([t for t in text_chunks if t]).strip()
 
-        raw = r.choices[0].message.content.strip()
-        # super light json parse without importing json (keep simple)
-        if raw.startswith("{") and raw.endswith("}"):
-            # if it's valid JSON, parse properly
-            import json
-            obj = json.loads(raw)
-            if obj.get("intent") == "none":
-                return None
-            return obj
-        return None
-    except Exception:
+        parsed = _safe_json_extract(combined) if combined else None
+        if not parsed or "intent" not in parsed:
+            return None
+
+        # normalize
+        intent = (parsed.get("intent") or "unknown").lower()
+        service = (parsed.get("service") or "").strip()
+        when_text = (parsed.get("when_text") or "").strip()
+        booking_index = parsed.get("booking_index") or 0
+
+        out = {"intent": intent, "service": service, "when_text": when_text, "booking_index": booking_index}
+
+        if DEBUG_LLM:
+            print("LLM OUT:", out)
+
+        return out
+
+    except Exception as e:
+        if DEBUG_LLM:
+            print("LLM ERROR:", repr(e))
         return None

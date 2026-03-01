@@ -9,26 +9,28 @@ from google.oauth2.service_account import Credentials
 TIMEZONE_HINT = os.getenv("TIMEZONE_HINT", "Europe/London").strip()
 TZ = ZoneInfo(TIMEZONE_HINT)
 
-GOOGLE_CALENDAR_ID_ENV = os.getenv("GOOGLE_CALENDAR_ID", "").strip()
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "").strip()
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
+_service = None
+
 
 def _calendar_service():
+    global _service
+    if _service is not None:
+        return _service
+
+    if not GOOGLE_CALENDAR_ID:
+        raise RuntimeError("Missing GOOGLE_CALENDAR_ID")
     if not GOOGLE_CREDENTIALS_JSON:
         raise RuntimeError("Missing GOOGLE_CREDENTIALS_JSON")
 
     info = json.loads(GOOGLE_CREDENTIALS_JSON)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
-
-
-def _cal_id(calendar_id: str | None) -> str:
-    cid = (calendar_id or "").strip() or GOOGLE_CALENDAR_ID_ENV
-    if not cid:
-        raise RuntimeError("Missing GOOGLE_CALENDAR_ID")
-    return cid
+    _service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    return _service
 
 
 def _to_rfc3339(dt: datetime) -> str:
@@ -37,56 +39,39 @@ def _to_rfc3339(dt: datetime) -> str:
     return dt.astimezone(TZ).isoformat()
 
 
-def is_time_available(calendar_id: str, start_dt: datetime, duration_min: int = 30) -> bool:
+def is_time_available(start_dt: datetime, duration_min: int) -> bool:
     svc = _calendar_service()
-    cid = _cal_id(calendar_id)
     end_dt = start_dt + timedelta(minutes=duration_min)
 
-    fb = svc.freebusy().query(body={
-        "timeMin": _to_rfc3339(start_dt),
-        "timeMax": _to_rfc3339(end_dt),
-        "items": [{"id": cid}],
-    }).execute()
+    fb = svc.freebusy().query(
+        body={
+            "timeMin": _to_rfc3339(start_dt),
+            "timeMax": _to_rfc3339(end_dt),
+            "items": [{"id": GOOGLE_CALENDAR_ID}],
+        }
+    ).execute()
 
-    busy = fb.get("calendars", {}).get(cid, {}).get("busy", [])
+    busy = fb.get("calendars", {}).get(GOOGLE_CALENDAR_ID, {}).get("busy", [])
     return len(busy) == 0
 
 
-def next_available_slots(
-    calendar_id: str,
-    start_dt: datetime,
-    duration_min: int = 30,
-    step_minutes: int = 15,
-    count: int = 3,
-):
+def next_available_slots(start_dt: datetime, duration_min: int, step_min: int = 15, count: int = 5):
     slots = []
     cur = start_dt
-    step = timedelta(minutes=step_minutes)
+    step = timedelta(minutes=step_min)
     limit = start_dt + timedelta(days=7)
 
     while cur < limit and len(slots) < count:
-        if is_time_available(calendar_id, cur, duration_min):
+        if is_time_available(cur, duration_min):
             slots.append(cur)
         cur += step
 
     return slots
 
 
-def create_booking_event(
-    calendar_id: str,
-    service_name: str,
-    start_dt: datetime,
-    duration_minutes: int,
-    customer_number: str,
-    price: int | None = None,
-):
-    """
-    Returns: (event_id, htmlLink)
-    """
+def create_booking_event(start_dt: datetime, duration_min: int, service_name: str, phone: str, price=None):
     svc = _calendar_service()
-    cid = _cal_id(calendar_id)
-
-    end_dt = start_dt + timedelta(minutes=int(duration_minutes))
+    end_dt = start_dt + timedelta(minutes=duration_min)
 
     summary = service_name
     if price is not None and price != 0:
@@ -96,39 +81,21 @@ def create_booking_event(
         "summary": summary,
         "start": {"dateTime": _to_rfc3339(start_dt), "timeZone": TIMEZONE_HINT},
         "end": {"dateTime": _to_rfc3339(end_dt), "timeZone": TIMEZONE_HINT},
-        "extendedProperties": {
-            "private": {
-                "phone": (customer_number or "").strip(),
-            }
-        },
+        "extendedProperties": {"private": {"phone": phone}},
     }
 
-    created = svc.events().insert(calendarId=cid, body=event).execute()
+    created = svc.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
     return created.get("id"), created.get("htmlLink")
 
 
-def delete_booking_event(calendar_id: str, event_id: str) -> bool:
-    try:
-        svc = _calendar_service()
-        cid = _cal_id(calendar_id)
-        svc.events().delete(calendarId=cid, eventId=event_id).execute()
-        return True
-    except Exception:
-        return False
-
-
-def list_bookings_for_phone(calendar_id: str, phone: str, max_results: int = 20):
-    """
-    Returns list of:
-      { event_id, summary, start(datetime tz-aware), link(htmlLink or None) }
-    """
+def list_bookings_for_phone(phone: str, max_results: int = 20):
     svc = _calendar_service()
-    cid = _cal_id(calendar_id)
-
     now = datetime.now(TZ)
+    time_min = _to_rfc3339(now)
+
     events = svc.events().list(
-        calendarId=cid,
-        timeMin=_to_rfc3339(now),
+        calendarId=GOOGLE_CALENDAR_ID,
+        timeMin=time_min,
         singleEvents=True,
         orderBy="startTime",
         maxResults=max_results,
@@ -137,7 +104,7 @@ def list_bookings_for_phone(calendar_id: str, phone: str, max_results: int = 20)
     out = []
     for e in events.get("items", []):
         priv = (e.get("extendedProperties") or {}).get("private") or {}
-        if (priv.get("phone") or "").strip() != (phone or "").strip():
+        if priv.get("phone") != phone:
             continue
 
         start = e.get("start", {}).get("dateTime")
@@ -145,12 +112,41 @@ def list_bookings_for_phone(calendar_id: str, phone: str, max_results: int = 20)
             continue
 
         start_dt = datetime.fromisoformat(start).astimezone(TZ)
-
-        out.append({
-            "event_id": e.get("id"),
-            "summary": e.get("summary", "Booking"),
-            "start": start_dt,
-            "link": e.get("htmlLink"),
-        })
-
+        out.append(
+            {
+                "event_id": e["id"],
+                "summary": e.get("summary", "Booking"),
+                "start_dt": start_dt,
+                "htmlLink": e.get("htmlLink"),
+            }
+        )
     return out
+
+
+def cancel_booking_by_index(phone: str, index_1based: int):
+    bookings = list_bookings_for_phone(phone)
+    if index_1based < 1 or index_1based > len(bookings):
+        return False, "Invalid selection"
+
+    eid = bookings[index_1based - 1]["event_id"]
+    svc = _calendar_service()
+    svc.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=eid).execute()
+    return True, "Cancelled"
+
+
+def reschedule_booking_by_index(phone: str, index_1based: int, new_start_dt: datetime, duration_min: int):
+    bookings = list_bookings_for_phone(phone)
+    if index_1based < 1 or index_1based > len(bookings):
+        return False, "Invalid selection"
+
+    eid = bookings[index_1based - 1]["event_id"]
+    svc = _calendar_service()
+
+    event = svc.events().get(calendarId=GOOGLE_CALENDAR_ID, eventId=eid).execute()
+    new_end_dt = new_start_dt + timedelta(minutes=duration_min)
+
+    event["start"] = {"dateTime": _to_rfc3339(new_start_dt), "timeZone": TIMEZONE_HINT}
+    event["end"] = {"dateTime": _to_rfc3339(new_end_dt), "timeZone": TIMEZONE_HINT}
+
+    updated = svc.events().update(calendarId=GOOGLE_CALENDAR_ID, eventId=eid, body=event).execute()
+    return True, updated.get("htmlLink")
