@@ -20,19 +20,26 @@ def _breaker_trip(phone: str):
     _BREAKER[phone] = time.time() + _BREAKER_SECONDS
 
 
-def llm_extract(phone: str, user_text: str, service_names: list[str]):
+def llm_extract(*args):
     """
-    Safe extractor.
-
-    Returns dict OR None
-    Never crashes.
+    Supports both call styles:
+      llm_extract(text, service_names)
+      llm_extract(phone, text, service_names)
+    Returns dict or None, never raises.
     """
+    # Unpack args safely
+    phone = "global"
+    user_text = ""
+    service_names = []
 
-    if not OPENAI_API_KEY:
+    if len(args) == 2:
+        user_text, service_names = args
+    elif len(args) == 3:
+        phone, user_text, service_names = args
+    else:
         return None
 
-    if not _breaker_ok(phone):
-        return None
+    # --- existing logic below, using phone/user_text/service_names ---
 
     try:
 
