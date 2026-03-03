@@ -237,7 +237,7 @@ def whatsapp():
 
         create_booking(from_number, svc_tuple[0], start_dt, minutes=svc_tuple[2])
         reset_state(from_number)
-        msg.body(f"✅ Booked *{svc_tuple[0]}* for {start_dt.strftime('%a %d %b %I:%M%p')}")
+        msg.body(f"✅ Booked *{svc_tuple[0]}* for {start_dt.strftime(...)}")
         return str(resp)
 
     reset_state(from_number)
