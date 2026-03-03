@@ -15,6 +15,8 @@ BUSINESS_NAME = os.getenv("BUSINESS_NAME", "BBC Barbers")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/London")
 TZ = ZoneInfo(TIMEZONE)
 
+DEBUG_LLM = os.getenv("DEBUG_LLM", "0") == "1"
+
 # Services (name, price, minutes)
 SERVICES = [
     ("Haircut", 18, 30),
@@ -30,7 +32,7 @@ SERVICE_BY_NAME = {s[0].lower(): s for s in SERVICES}
 SERVICE_BY_NUM = {str(i + 1): SERVICES[i] for i in range(len(SERVICES))}
 
 # simple in-memory state
-STATE = {}  # phone -> dict(state="MENU"/"AWAIT_TIME", service=...)
+STATE = {}  # phone -> dict(state="MENU"/"AWAIT_TIME", service=tuple)
 
 def get_state(phone: str):
     return STATE.get(phone, {"state": "MENU"})
@@ -46,7 +48,7 @@ def reset_state(phone: str):
 def menu_text() -> str:
     lines = [
         f"💈 *{BUSINESS_NAME}*",
-        "Welcome! Reply with a number or name:\n",
+        "Welcome! Reply with a number or name:\n"
     ]
     for i, (name, price, mins) in enumerate(SERVICES, start=1):
         lines.append(f"{i}) {name} — £{price} ({mins}m)")
@@ -56,6 +58,8 @@ def menu_text() -> str:
     lines.append("Tip: You can type a full sentence like:")
     lines.append("• Book a skin fade tomorrow at 2pm")
     lines.append("• Can I get a haircut Friday at 2pm?")
+    lines.append("")
+    lines.append("Type MENU anytime to see this again.")
     return "\n".join(lines)
 
 def normalize_time_text(text: str) -> str:
@@ -65,10 +69,6 @@ def normalize_time_text(text: str) -> str:
     return t
 
 def parse_datetime(user_text: str):
-    """
-    Uses dateparser for natural language like:
-    'tomorrow 2pm', 'fri 15:30', '10/02 15:30', etc.
-    """
     import dateparser
     raw = normalize_time_text(user_text.lower())
     settings = {
@@ -91,29 +91,25 @@ def bookings_text(phone: str) -> str:
 
 def try_llm_first(text: str, phone: str):
     """
-    LLM-first for sentences (works from ANY state).
+    LLM-first for sentences (so it works from ANY state).
     Returns (handled: bool, response_text: str)
     """
-    # Only try LLM if it looks like a sentence
+    # only try LLM if it looks like a sentence
     if len(text.split()) < 3:
         return False, ""
 
-    lower = text.lower()
+    if DEBUG_LLM:
+        print("LLM DEBUG: about to call llm_extract", flush=True)
 
-    print("LLM DEBUG: about to call llm_extract", flush=True)
     llm = llm_extract(text, SERVICE_NAMES, phone=phone)
-    print("LLM DEBUG: llm_extract returned:", llm, flush=True)
+
+    if DEBUG_LLM:
+        print("LLM DEBUG: llm_extract returned:", llm, flush=True)
 
     if not llm:
         return False, ""
 
     intent = (llm.get("intent") or "").lower().strip()
-
-    # Safety guard:
-    # If user is clearly booking but LLM says "menu", ignore that LLM result
-    looks_like_booking = ("book" in lower) or any(s.lower() in lower for s in SERVICE_NAMES)
-    if intent == "menu" and looks_like_booking:
-        return False, ""
 
     if intent == "menu":
         reset_state(phone)
@@ -121,9 +117,6 @@ def try_llm_first(text: str, phone: str):
 
     if intent == "view":
         reset_state(phone)
-        return True, bookings_text(phone)
-
-    if intent in ("cancel", "reschedule"):
         return True, bookings_text(phone)
 
     if intent == "book":
@@ -138,10 +131,7 @@ def try_llm_first(text: str, phone: str):
 
         if not when_text:
             set_state(phone, state="AWAIT_TIME", service=svc_tuple)
-            return True, (
-                f"✂️ {svc_tuple[0]}\nWhat day & time?\n"
-                "Examples: Tomorrow 2pm | Fri 2pm | 10/02 15:30"
-            )
+            return True, f"✂️ {svc_tuple[0]}\nWhat day & time?\nExamples: Tomorrow 2pm | Fri 2pm | 10/02 15:30\n\nReply BACK to change service."
 
         dt = parse_datetime(when_text)
         if not dt:
@@ -158,8 +148,10 @@ def try_llm_first(text: str, phone: str):
         reset_state(phone)
         return True, f"✅ Booked *{svc_tuple[0]}* for {start_dt.strftime('%a %d %b %I:%M%p')}"
 
-    return False, ""
+    if intent in ("cancel", "reschedule"):
+        return True, bookings_text(phone)
 
+    return False, ""
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
@@ -180,7 +172,7 @@ def whatsapp():
         msg.body(bookings_text(from_number))
         return str(resp)
 
-    # Cancel shortcut: "CANCEL 1"
+    # Cancel command shortcut: "CANCEL 1"
     m = re.match(r"^\s*CANCEL\s+(\d+)\s*$", text_upper)
     if m:
         idx = int(m.group(1))
@@ -198,12 +190,13 @@ def whatsapp():
         msg.body(out)
         return str(resp)
 
+    # state flow
     st = get_state(from_number)
     state = st.get("state", "MENU")
 
-    # Normal menu flow
     if state == "MENU":
         svc_tuple = None
+
         if text in SERVICE_BY_NUM:
             svc_tuple = SERVICE_BY_NUM[text]
         else:
@@ -218,8 +211,8 @@ def whatsapp():
         set_state(from_number, state="AWAIT_TIME", service=svc_tuple)
         msg.body(
             f"✂️ {svc_tuple[0]}\nWhat day & time?\n"
-            "Examples: Tomorrow 2pm | Fri 2pm | 10/02 15:30\n\n"
-            "Reply BACK to change service."
+            f"Examples: Tomorrow 2pm | Fri 2pm | 10/02 15:30\n\n"
+            f"Reply BACK to change service."
         )
         return str(resp)
 
@@ -250,7 +243,6 @@ def whatsapp():
     reset_state(from_number)
     msg.body(menu_text())
     return str(resp)
-
 
 @app.get("/")
 def health():
