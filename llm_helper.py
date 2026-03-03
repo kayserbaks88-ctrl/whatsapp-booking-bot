@@ -1,110 +1,84 @@
 import os
 import json
-import time
-from typing import Optional, Dict, List
+from typing import Optional, Dict, Any, List
 
 from openai import OpenAI
 
-# ---- Config ----
-OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
-OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
-OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "12"))
-DEBUG_LLM = os.getenv("DEBUG_LLM", "0") == "1"
+# Model choice:
+# - Set OPENAI_MODEL=gpt-4.1   (best quality)
+# - or OPENAI_MODEL=gpt-4.1-mini (cheaper/faster)
+#
+# OpenAI docs show GPT-4.1 series supported in Responses API. :contentReference[oaicite:0]{index=0}
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# circuit breaker memory (per phone)
-_BREAKER: Dict[str, float] = {}
-_BREAKER_SECONDS = 600  # 10 minutes
+SYSTEM = """You are an intent extractor for a WhatsApp barbershop booking bot.
+Return ONLY valid JSON (no markdown).
+Keys:
+- intent: one of ["menu","view","book","cancel","reschedule","unknown"]
+- service: lowercase service name if present else ""
+- when_text: the time text if present else ""
+Rules:
+- If user asks to see menu -> intent "menu"
+- If user asks to view bookings -> intent "view"
+- If user is booking -> intent "book" and include service + when_text if present
+- If user wants cancel/reschedule -> those intents
+"""
 
-
-def _breaker_ok(phone: str) -> bool:
-    return time.time() >= _BREAKER.get(phone, 0)
-
-
-def _breaker_trip(phone: str) -> None:
-    _BREAKER[phone] = time.time() + _BREAKER_SECONDS
-
-
-def llm_extract(user_text: str, service_names: List[str], phone: str = "") -> Optional[dict]:
+def llm_extract(text: str, service_names: List[str], phone: str = "") -> Optional[Dict[str, Any]]:
     """
-    Returns dict like:
-      {"intent":"book|menu|view|cancel|reschedule|unknown",
-       "service":"Haircut|Skin Fade|...",
-       "when_text":"tomorrow 2pm"}
-    or None if not confident / error.
+    Returns a dict like:
+      {"intent":"book","service":"haircut","when_text":"tomorrow 2pm"}
+    or None on failure.
     """
-    if not client:
-        if DEBUG_LLM:
-            print("LLM DEBUG: OPENAI_API_KEY missing -> llm_extract disabled", flush=True)
+
+    if not os.getenv("OPENAI_API_KEY"):
+        # Very common cause of your "Missing bearer authentication" / connection issues
+        print("LLM ERROR: OPENAI_API_KEY missing in environment", flush=True)
         return None
-
-    if phone and not _breaker_ok(phone):
-        if DEBUG_LLM:
-            print("LLM DEBUG: breaker active for", phone, flush=True)
-        return None
-
-    text = (user_text or "").strip()
-    if not text:
-        return None
-
-    # Keep prompt tight/stable
-    services_line = ", ".join(service_names)
-
-    system = (
-        "You are an assistant that extracts booking intent from a message for a barbershop WhatsApp bot.\n"
-        "Return ONLY valid JSON with keys: intent, service, when_text.\n"
-        "intent must be one of: book, menu, view, cancel, reschedule, unknown.\n"
-        "service must be exactly one of the provided services or empty string.\n"
-        "when_text should be the raw time phrase from the user (e.g. 'tomorrow 2pm') or empty string.\n"
-        "If user is not clearly booking or asking menu/bookings, return intent='unknown'."
-    )
-
-    user = (
-        f"Services: {services_line}\n"
-        f"Message: {text}\n\n"
-        "Respond with JSON only."
-    )
 
     try:
-        if DEBUG_LLM:
-            print("LLM DEBUG: calling OpenAI model:", OPENAI_MODEL, flush=True)
+        allowed_services = ", ".join([s.lower() for s in service_names])
+
+        prompt = f"""
+User message: {text}
+
+Allowed services (lowercase): {allowed_services}
+
+Return JSON only.
+"""
 
         resp = client.responses.create(
-            model=OPENAI_MODEL,
+            model=DEFAULT_MODEL,
             input=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": prompt},
             ],
-            # small + deterministic-ish
-            temperature=0.0,
-            max_output_tokens=120,
-            timeout=OPENAI_TIMEOUT,
         )
 
-        out_text = (resp.output_text or "").strip()
-        if DEBUG_LLM:
-            print("LLM DEBUG: raw output:", out_text, flush=True)
+        # Responses API returns a structured object; easiest is to pull the output text.
+        out_text = ""
+        for item in resp.output:
+            if item.type == "message":
+                for c in item.content:
+                    if c.type == "output_text":
+                        out_text += c.text
+
+        out_text = (out_text or "").strip()
+        if not out_text:
+            print("LLM ERROR: empty response text", flush=True)
+            return None
 
         data = json.loads(out_text)
 
-        intent = (data.get("intent") or "").strip().lower()
-        service = (data.get("service") or "").strip()
+        # normalize
+        intent = (data.get("intent") or "unknown").lower().strip()
+        service = (data.get("service") or "").lower().strip()
         when_text = (data.get("when_text") or "").strip()
 
-        if intent not in {"book", "menu", "view", "cancel", "reschedule", "unknown"}:
-            return None
-
-        if service and service not in service_names:
-            # sometimes model returns close text; reject to avoid bad bookings
-            service = ""
-
-        cleaned = {"intent": intent, "service": service, "when_text": when_text}
-        return cleaned
+        return {"intent": intent, "service": service, "when_text": when_text}
 
     except Exception as e:
-        if DEBUG_LLM:
-            print("LLM error:", repr(e), flush=True)
-        if phone:
-            _breaker_trip(phone)
+        print("LLM error:", repr(e), flush=True)
         return None
