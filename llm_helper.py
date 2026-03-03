@@ -1,136 +1,137 @@
 import os
 import json
 import time
+import requests
 
-OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
-OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
-OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "10"))
-DEBUG_LLM = os.getenv("DEBUG_LLM", "0") == "1"
+# Provider switch (so you can turn LLM off without code changes)
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 
-# circuit breaker memory
+# Ollama settings
+OLLAMA_BASE_URL = (os.getenv("OLLAMA_BASE_URL") or "").strip().rstrip("/")
+OLLAMA_MODEL = (os.getenv("OLLAMA_MODEL") or "llama3:8b").strip()
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "10"))
+
+# Optional debug
+DEBUG_LLM = os.getenv("DEBUG_LLM", "0").strip() == "1"
+
+# Circuit breaker (per phone) to avoid repeated failures
 _BREAKER = {}
-_BREAKER_SECONDS = 600
+_BREAKER_SECONDS = int(os.getenv("LLM_BREAKER_SECONDS", "600"))
 
-
-def _breaker_ok(phone: str):
+def _breaker_ok(phone: str) -> bool:
     return time.time() >= _BREAKER.get(phone, 0)
-
 
 def _breaker_trip(phone: str):
     _BREAKER[phone] = time.time() + _BREAKER_SECONDS
 
-
-def llm_extract(*args):
+def _extract_json(text: str):
     """
-    Supports both call styles:
-      llm_extract(text, service_names)
-      llm_extract(phone, text, service_names)
-    Returns dict or None, never raises.
+    Ollama sometimes returns JSON with extra text.
+    This tries to extract the first valid JSON object.
     """
-    # Unpack args safely
-    phone = "global"
-    user_text = ""
-    service_names = []
-
-    if len(args) == 2:
-        user_text, service_names = args
-    elif len(args) == 3:
-        phone, user_text, service_names = args
-    else:
+    if not text:
         return None
 
-    # --- existing logic below, using phone/user_text/service_names ---
+    text = text.strip()
+
+    # Fast path: already JSON
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Try to find a JSON object inside the text
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start:end+1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            return None
+
+    return None
+
+def llm_extract(user_text: str, service_names: list[str], phone: str = ""):
+    """
+    Returns dict like:
+      {"intent":"book","service":"Haircut","when_text":"tomorrow 2pm"}
+      {"intent":"menu"}
+      {"intent":"view"}
+      {"intent":"cancel","booking_index":1}
+      {"intent":"reschedule","booking_index":1}
+
+    Or None if disabled / failed.
+    """
+    if LLM_PROVIDER != "ollama":
+        return None
+
+    if not OLLAMA_BASE_URL:
+        if DEBUG_LLM:
+            print("LLM: missing OLLAMA_BASE_URL")
+        return None
+
+    if phone and not _breaker_ok(phone):
+        return None
+
+    # Keep the model tightly controlled: intent extraction only
+    system = (
+        "You are a strict JSON extractor for a barber booking assistant.\n"
+        "Return ONLY valid JSON. No markdown. No extra text.\n"
+        "Allowed intents: book, menu, view, cancel, reschedule, help.\n"
+        "If intent is book, include keys: intent, service, when_text.\n"
+        "If intent is cancel/reschedule and user refers to a number, include booking_index (1-based).\n"
+        "If unsure, use intent=help.\n"
+    )
+
+    services_line = "Services: " + ", ".join(service_names[:50])
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "system", "content": services_line},
+            {"role": "user", "content": user_text},
+        ],
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+        },
+    }
 
     try:
-
-        from openai import OpenAI
-        client = OpenAI(
-            api_key=OPENAI_API_KEY,
-            timeout=OPENAI_TIMEOUT
+        r = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json=payload,
+            timeout=LLM_TIMEOUT,
         )
+        r.raise_for_status()
 
-        system_prompt = f"""
-You are a JSON extractor.
-
-Return ONLY valid JSON.
-
-Allowed intents:
-
-book
-menu
-view
-cancel
-reschedule
-
-Services allowed:
-
-{service_names}
-
-Examples:
-
-User: haircut tomorrow 2pm
-
-Output:
-
-{{"intent":"book","service":"Haircut","when_text":"tomorrow 2pm"}}
-
-User: cancel my booking
-
-Output:
-
-{{"intent":"cancel"}}
-"""
-
-        resp = client.chat.completions.create(
-
-            model=OPENAI_MODEL,
-
-            messages=[
-
-                {"role": "system", "content": system_prompt},
-
-                {"role": "user", "content": user_text}
-
-            ],
-
-            temperature=0,
-
-            max_tokens=120
-
-        )
-
-        text = resp.choices[0].message.content.strip()
+        data = r.json()
+        content = (data.get("message", {}) or {}).get("content", "")
 
         if DEBUG_LLM:
-            print("LLM RAW:", text)
+            print("LLM raw:", content)
 
-        data = json.loads(text)
-
-        # validate
-
-        intent = data.get("intent")
-
-        if intent not in [
-            "book",
-            "menu",
-            "view",
-            "cancel",
-            "reschedule"
-        ]:
+        obj = _extract_json(content)
+        if not isinstance(obj, dict):
             return None
 
-        service = data.get("service")
+        # Normalize a bit
+        if "intent" in obj and isinstance(obj["intent"], str):
+            obj["intent"] = obj["intent"].strip().lower()
 
-        if service and service not in service_names:
-            return None
+        if "service" in obj and isinstance(obj["service"], str):
+            obj["service"] = obj["service"].strip()
 
-        return data
+        if "when_text" in obj and isinstance(obj["when_text"], str):
+            obj["when_text"] = obj["when_text"].strip()
+
+        return obj
 
     except Exception as e:
-
         if DEBUG_LLM:
-            print("LLM ERROR:", e)
-
-        _breaker_trip(phone)
-
+            print("LLM error:", repr(e))
+        if phone:
+            _breaker_trip(phone)
         return None

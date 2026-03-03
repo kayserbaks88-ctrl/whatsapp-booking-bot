@@ -359,7 +359,7 @@ def whatsapp():
             return str(resp)
 
         # -------- LLM fallback ONLY if still not understood --------
-        llm = llm_extract(text, SERVICE_NAMES)
+        llm = llm_extract(text, SERVICE_NAMES, phone=from_number)
         if llm:
             intent = (llm.get("intent") or "").lower().strip()
 
