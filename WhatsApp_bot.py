@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from flask import Flask, request
@@ -27,10 +27,10 @@ SERVICES = [
 
 SERVICE_NAMES = [s[0] for s in SERVICES]
 SERVICE_BY_NAME = {s[0].lower(): s for s in SERVICES}
-SERVICE_BY_NUM = {str(i+1): SERVICES[i] for i in range(len(SERVICES))}
+SERVICE_BY_NUM = {str(i + 1): SERVICES[i] for i in range(len(SERVICES))}
 
-# simple in-memory state (Render is single instance usually; this is OK for now)
-STATE = {}  # phone -> dict(state="MENU"/"AWAIT_TIME"/"CANCEL_PICK", service=..., when_text=..., etc.)
+# simple in-memory state
+STATE = {}  # phone -> dict(state="MENU"/"AWAIT_TIME", service=...)
 
 def get_state(phone: str):
     return STATE.get(phone, {"state": "MENU"})
@@ -44,8 +44,10 @@ def reset_state(phone: str):
     STATE[phone] = {"state": "MENU"}
 
 def menu_text() -> str:
-    lines = [f"💈 *{BUSINESS_NAME}*",
-             "Welcome! Reply with a number or name:\n"]
+    lines = [
+        f"💈 *{BUSINESS_NAME}*",
+        "Welcome! Reply with a number or name:\n",
+    ]
     for i, (name, price, mins) in enumerate(SERVICES, start=1):
         lines.append(f"{i}) {name} — £{price} ({mins}m)")
     lines.append("")
@@ -64,9 +66,8 @@ def normalize_time_text(text: str) -> str:
 
 def parse_datetime(user_text: str):
     """
-    Lightweight: expects 'tomorrow 2pm', 'fri 15:30', '10/02 15:30', etc.
-    Uses dateparser if you already had it, but to keep stable we do a minimal parse.
-    If you want the best parsing, tell me and I’ll wire dateparser back in cleanly.
+    Uses dateparser for natural language like:
+    'tomorrow 2pm', 'fri 15:30', '10/02 15:30', etc.
     """
     import dateparser
     raw = normalize_time_text(user_text.lower())
@@ -76,8 +77,7 @@ def parse_datetime(user_text: str):
         "PREFER_DATES_FROM": "future",
         "RELATIVE_BASE": datetime.now(TZ),
     }
-    dt = dateparser.parse(raw, settings=settings)
-    return dt
+    return dateparser.parse(raw, settings=settings)
 
 def bookings_text(phone: str) -> str:
     items = list_upcoming(phone, limit=10)
@@ -91,18 +91,29 @@ def bookings_text(phone: str) -> str:
 
 def try_llm_first(text: str, phone: str):
     """
-    LLM-first for sentences (so it works from ANY state).
+    LLM-first for sentences (works from ANY state).
     Returns (handled: bool, response_text: str)
     """
-    # only try LLM if it looks like a sentence
+    # Only try LLM if it looks like a sentence
     if len(text.split()) < 3:
         return False, ""
 
+    lower = text.lower()
+
+    print("LLM DEBUG: about to call llm_extract", flush=True)
     llm = llm_extract(text, SERVICE_NAMES, phone=phone)
+    print("LLM DEBUG: llm_extract returned:", llm, flush=True)
+
     if not llm:
         return False, ""
 
     intent = (llm.get("intent") or "").lower().strip()
+
+    # Safety guard:
+    # If user is clearly booking but LLM says "menu", ignore that LLM result
+    looks_like_booking = ("book" in lower) or any(s.lower() in lower for s in SERVICE_NAMES)
+    if intent == "menu" and looks_like_booking:
+        return False, ""
 
     if intent == "menu":
         reset_state(phone)
@@ -110,6 +121,9 @@ def try_llm_first(text: str, phone: str):
 
     if intent == "view":
         reset_state(phone)
+        return True, bookings_text(phone)
+
+    if intent in ("cancel", "reschedule"):
         return True, bookings_text(phone)
 
     if intent == "book":
@@ -121,9 +135,13 @@ def try_llm_first(text: str, phone: str):
             return True, "Which service would you like?\n\n" + menu_text()
 
         svc_tuple = SERVICE_BY_NAME[svc]
+
         if not when_text:
             set_state(phone, state="AWAIT_TIME", service=svc_tuple)
-            return True, f"✂️ {svc_tuple[0]}\nWhat day & time?\nExamples: Tomorrow 2pm | Fri 2pm | 10/02 15:30"
+            return True, (
+                f"✂️ {svc_tuple[0]}\nWhat day & time?\n"
+                "Examples: Tomorrow 2pm | Fri 2pm | 10/02 15:30"
+            )
 
         dt = parse_datetime(when_text)
         if not dt:
@@ -131,24 +149,17 @@ def try_llm_first(text: str, phone: str):
             return True, f"✂️ {svc_tuple[0]}\nI couldn’t understand the time. Try: Tomorrow 2pm"
 
         start_dt = dt.astimezone(TZ)
-        end_dt = start_dt.replace()  # placeholder; calendar_helper computes end based on minutes
-        # conflict check:
-        from datetime import timedelta
         end_dt = start_dt + timedelta(minutes=svc_tuple[2])
 
         if not is_free(start_dt, end_dt):
             return True, "❌ That slot is taken. Try another time."
 
-        event_id = create_booking(phone, svc_tuple[0], start_dt, minutes=svc_tuple[2])
+        create_booking(phone, svc_tuple[0], start_dt, minutes=svc_tuple[2])
         reset_state(phone)
         return True, f"✅ Booked *{svc_tuple[0]}* for {start_dt.strftime('%a %d %b %I:%M%p')}"
 
-    if intent in ("cancel", "reschedule"):
-        # For simplicity: show bookings and ask user to reply with index/time.
-        # (Reschedule can be added cleanly next.)
-        return True, bookings_text(phone)
-
     return False, ""
+
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
@@ -169,6 +180,18 @@ def whatsapp():
         msg.body(bookings_text(from_number))
         return str(resp)
 
+    # Cancel shortcut: "CANCEL 1"
+    m = re.match(r"^\s*CANCEL\s+(\d+)\s*$", text_upper)
+    if m:
+        idx = int(m.group(1))
+        items = list_upcoming(from_number, limit=10)
+        if 1 <= idx <= len(items):
+            cancel_booking(items[idx - 1]["id"])
+            msg.body("✅ Cancelled.")
+        else:
+            msg.body("❌ Invalid booking number.")
+        return str(resp)
+
     # LLM-first (works from ANY state)
     handled, out = try_llm_first(text, from_number)
     if handled:
@@ -178,21 +201,8 @@ def whatsapp():
     st = get_state(from_number)
     state = st.get("state", "MENU")
 
-    # Cancel command shortcut: "CANCEL 1"
-    m = re.match(r"^\s*CANCEL\s+(\d+)\s*$", text_upper)
-    if m:
-        idx = int(m.group(1))
-        items = list_upcoming(from_number, limit=10)
-        if 1 <= idx <= len(items):
-            cancel_booking(items[idx-1]["id"])
-            msg.body("✅ Cancelled.")
-        else:
-            msg.body("❌ Invalid booking number.")
-        return str(resp)
-
     # Normal menu flow
     if state == "MENU":
-        # accept number or name
         svc_tuple = None
         if text in SERVICE_BY_NUM:
             svc_tuple = SERVICE_BY_NUM[text]
@@ -206,7 +216,11 @@ def whatsapp():
             return str(resp)
 
         set_state(from_number, state="AWAIT_TIME", service=svc_tuple)
-        msg.body(f"✂️ {svc_tuple[0]}\nWhat day & time?\nExamples: Tomorrow 2pm | Fri 2pm | 10/02 15:30\n\nReply BACK to change service.")
+        msg.body(
+            f"✂️ {svc_tuple[0]}\nWhat day & time?\n"
+            "Examples: Tomorrow 2pm | Fri 2pm | 10/02 15:30\n\n"
+            "Reply BACK to change service."
+        )
         return str(resp)
 
     if state == "AWAIT_TIME":
@@ -221,7 +235,6 @@ def whatsapp():
             msg.body("I couldn’t understand that time. Try: Tomorrow 2pm")
             return str(resp)
 
-        from datetime import timedelta
         start_dt = dt.astimezone(TZ)
         end_dt = start_dt + timedelta(minutes=svc_tuple[2])
 
@@ -237,6 +250,7 @@ def whatsapp():
     reset_state(from_number)
     msg.body(menu_text())
     return str(resp)
+
 
 @app.get("/")
 def health():
