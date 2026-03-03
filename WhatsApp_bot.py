@@ -235,15 +235,19 @@ def whatsapp():
             msg.body("❌ That slot is taken. Try another time.")
             return str(resp)
 
-        create_booking(from_number, svc_tuple[0], start_dt, minutes=svc_tuple[2])
+        result = create_booking(from_number, svc_tuple[0], start_dt, minutes=svc_tuple[2])
+
+        link_line = ""
+        if isinstance(result, dict) and result.get("link"):
+            link_line = f"\n📅 View: {result['link']}"
+
         reset_state(from_number)
-        msg.body(f"✅ Booked *{svc_tuple[0]}* for {start_dt.strftime(...)}")
+
+        msg.body(
+           f"✅ Booked *{svc_tuple[0]}* for {start_dt.strftime('%a %d %b %I:%M%p')}{link_line}"
+        )
+
         return str(resp)
-
-    reset_state(from_number)
-    msg.body(menu_text())
-    return str(resp)
-
 @app.get("/")
 def health():
     return "ok", 200
