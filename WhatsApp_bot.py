@@ -48,8 +48,9 @@ def reset_state(phone: str):
 def menu_text() -> str:
     lines = [
         f"💈 *{BUSINESS_NAME}*",
-        "Welcome! Reply with a number or name:\n"
+        "Welcome! Reply with the number or just type the service name."
     ]
+
     for i, (name, price, mins) in enumerate(SERVICES, start=1):
         lines.append(f"{i}) {name} — £{price} ({mins}m)")
     lines.append("")
@@ -161,7 +162,16 @@ def whatsapp():
     from_number = request.values.get("From", "")
     text = (request.values.get("Body", "") or "").strip()
     text_upper = text.upper().strip()
+    text_lower = text.lower()
 
+    # polite replies
+    if any(word in text_lower for word in ["thanks", "thank you", "cheers", "nice one", "appreciate"]):
+        msg.body("You're very welcome! 😊 If you need anything else, just type MENU.")
+        return str(resp)
+
+    if any(word in text_lower for word in ["ok", "okay", "cool", "nice"]):
+        msg.body("Perfect 👌 Let me know if you'd like to book anything.")
+        return str(resp)
     # commands
     if text_upper in ("MENU", "BACK", "START"):
         reset_state(from_number)
@@ -242,12 +252,30 @@ def whatsapp():
             link_line = f"\n📅 View: {result['link']}"
 
         reset_state(from_number)
+    # booking logic above here
 
-        msg.body(
-           f"✅ Booked *{svc_tuple[0]}* for {start_dt.strftime('%a %d %b %I:%M%p')}{link_line}"
-        )
+    service_name = svc_tuple[0]
+    price = svc_tuple[1]
+    duration = svc_tuple[2]
 
-        return str(resp)
+    pretty_date = start_dt.strftime("%A %d %B")
+    pretty_time = start_dt.strftime("%I:%M %p")
+
+    confirmation_text = (
+        f"💈 *{BUSINESS_NAME}*\n\n"
+        f"✅ *Booking Confirmed*\n\n"
+        f"✂️ Service: {service_name}\n"
+        f"📅 Date: {pretty_date}\n"
+        f"⏰ Time: {pretty_time}\n"
+        f"💷 Price: £{price}\n"
+        f"⏳ Duration: {duration} mins\n\n"
+        f"You’ll receive a reminder before your appointment.\n\n"
+        f"Commands: CANCEL | RESCHEDULE | MENU"
+    )
+
+    msg.body(confirmation_text)
+
+    
 @app.get("/")
 def health():
     return "ok", 200
