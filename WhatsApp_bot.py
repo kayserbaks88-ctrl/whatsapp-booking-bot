@@ -246,6 +246,38 @@ def whatsapp():
         msg.body(menu_text())
         return str(resp)
 
+    # ================= AWAIT TIME STATE =================
+    if state == "AWAIT_TIME":
+
+        svc_tuple = st.get("service")
+        if not svc_tuple:
+            reset_state(from_number)
+            msg.body(menu_text())
+            return str(resp)
+
+        dt = parse_datetime(text)
+        if not dt:
+            msg.body("I couldn’t understand that time. Try: Tomorrow 2pm")
+            return str(resp)
+
+        start_dt = dt.astimezone(TZ)
+        end_dt = start_dt + timedelta(minutes=svc_tuple[2])
+
+        if not is_free(start_dt, end_dt):
+            msg.body("❌ That slot is taken. Try another time.")
+            return str(resp)
+
+        # Store time temporarily and ask for name
+        set_state(
+        from_number,
+             state="AWAIT_NAME",
+             service=svc_tuple,
+             pending_start=start_dt.isoformat()
+        )
+
+        msg.body("Almost done 👍\nWhat name should I book this under?")
+        return str(resp)
+   
     # ================= AWAIT NAME STATE =================
     if state == "AWAIT_NAME":
 
