@@ -90,7 +90,7 @@ def bookings_text(phone: str) -> str:
     out.append("\nReply: CANCEL 1  (or)  RESCHEDULE 1 Friday 3pm")
     return "\n".join(out)
 
-def try_llm_first(text: str, phone: str):
+def try_llm_first(text: str, phone: str, profile_name: str):
     """
     LLM-first for sentences (so it works from ANY state).
     Returns (handled: bool, response_text: str)
@@ -145,9 +145,25 @@ def try_llm_first(text: str, phone: str):
         if not is_free(start_dt, end_dt):
             return True, "❌ That slot is taken. Try another time."
 
-        create_booking(phone, svc_tuple[0], start_dt, minutes=svc_tuple[2])
+        result = create_booking(
+            phone,
+            svc_tuple[0],
+            start_dt,
+            minutes=svc_tuple[2],
+            name=profile_name
+        )
+
+        link_line = ""
+        if isinstance(result, dict) and result.get("link"):
+            link_line = f"\n📅 View: {result['link']}"
+
         reset_state(phone)
-        return True, f"✅ Booked *{svc_tuple[0]}* for {start_dt.strftime('%a %d %b %I:%M%p')}"
+
+        return True, (
+            f"✅ Booked *{svc_tuple[0]}* for "
+            f"{start_dt.strftime('%a %d %b %I:%M%p')}"
+            f"{link_line}"
+        )
 
     if intent in ("cancel", "reschedule"):
         return True, bookings_text(phone)
@@ -172,7 +188,8 @@ def whatsapp():
     if any(word in text_lower for word in ["ok", "okay", "cool", "nice"]):
         msg.body("Perfect 👌 Let me know if you'd like to book anything.")
         return str(resp)
-    # commands
+
+    # quick commands
     if text_upper in ("MENU", "BACK", "START"):
         reset_state(from_number)
         msg.body(menu_text())
@@ -182,7 +199,7 @@ def whatsapp():
         msg.body(bookings_text(from_number))
         return str(resp)
 
-    # Cancel command shortcut: "CANCEL 1"
+    # cancel shortcut
     m = re.match(r"^\s*CANCEL\s+(\d+)\s*$", text_upper)
     if m:
         idx = int(m.group(1))
@@ -194,17 +211,20 @@ def whatsapp():
             msg.body("❌ Invalid booking number.")
         return str(resp)
 
-    # LLM-first (works from ANY state)
-    handled, out = try_llm_first(text, from_number)
+    # LLM first
+    profile_name = request.values.get("ProfileName", "")
+    handled, out = try_llm_first(text, from_number, profile_name)
     if handled:
         msg.body(out)
         return str(resp)
 
-    # state flow
+    # state handling
     st = get_state(from_number)
     state = st.get("state", "MENU")
 
+    # ================= MENU STATE =================
     if state == "MENU":
+
         svc_tuple = None
 
         if text in SERVICE_BY_NUM:
@@ -214,19 +234,21 @@ def whatsapp():
             if key in SERVICE_BY_NAME:
                 svc_tuple = SERVICE_BY_NAME[key]
 
-        if not svc_tuple:
-            msg.body("Reply with a service number or name.\n\n" + menu_text())
+        if svc_tuple:
+            set_state(from_number, state="AWAIT_TIME", service=svc_tuple)
+            msg.body(
+                f"✂️ {svc_tuple[0]}\nWhat day & time?\n"
+                f"Examples: Tomorrow 2pm | Fri 2pm | 10/02 15:30\n\n"
+                f"Reply BACK to change service."
+            )
             return str(resp)
 
-        set_state(from_number, state="AWAIT_TIME", service=svc_tuple)
-        msg.body(
-            f"✂️ {svc_tuple[0]}\nWhat day & time?\n"
-            f"Examples: Tomorrow 2pm | Fri 2pm | 10/02 15:30\n\n"
-            f"Reply BACK to change service."
-        )
+        msg.body(menu_text())
         return str(resp)
 
+    # ================= AWAIT TIME STATE =================
     if state == "AWAIT_TIME":
+
         svc_tuple = st.get("service")
         if not svc_tuple:
             reset_state(from_number)
@@ -245,37 +267,44 @@ def whatsapp():
             msg.body("❌ That slot is taken. Try another time.")
             return str(resp)
 
-        result = create_booking(from_number, svc_tuple[0], start_dt, minutes=svc_tuple[2])
+        result = create_booking(
+            from_number,
+            svc_tuple[0],
+            start_dt,
+            minutes=svc_tuple[2],
+        )
 
         link_line = ""
         if isinstance(result, dict) and result.get("link"):
             link_line = f"\n📅 View: {result['link']}"
 
         reset_state(from_number)
-    # booking logic above here
 
-    service_name = svc_tuple[0]
-    price = svc_tuple[1]
-    duration = svc_tuple[2]
+        service_name = svc_tuple[0]
+        price = svc_tuple[1]
+        duration = svc_tuple[2]
 
-    pretty_date = start_dt.strftime("%A %d %B")
-    pretty_time = start_dt.strftime("%I:%M %p")
+        pretty_date = start_dt.strftime("%A %d %B")
+        pretty_time = start_dt.strftime("%I:%M %p")
 
-    confirmation_text = (
-        f"💈 *{BUSINESS_NAME}*\n\n"
-        f"✅ *Booking Confirmed*\n\n"
-        f"✂️ Service: {service_name}\n"
-        f"📅 Date: {pretty_date}\n"
-        f"⏰ Time: {pretty_time}\n"
-        f"💷 Price: £{price}\n"
-        f"⏳ Duration: {duration} mins\n\n"
-        f"You’ll receive a reminder before your appointment.\n\n"
-        f"Commands: CANCEL | RESCHEDULE | MENU"
-    )
+        confirmation_text = (
+            f"💈 *{BUSINESS_NAME}*\n\n"
+            f"✅ *Booking Confirmed*\n\n"
+            f"✂️ Service: {service_name}\n"
+            f"📅 Date: {pretty_date}\n"
+            f"⏰ Time: {pretty_time}\n"
+            f"💷 Price: £{price}\n"
+            f"⏳ Duration: {duration} mins"
+            f"{link_line}\n\n"
+            f"You’ll receive a reminder before your appointment.\n\n"
+            f"Commands: CANCEL | RESCHEDULE | MENU"
+        )
 
-    msg.body(confirmation_text)
+        msg.body(confirmation_text)
+        return str(resp)
+
+    # fallback
+    msg.body(menu_text())
     return str(resp)
-    
-@app.get("/")
 def health():
     return "ok", 200

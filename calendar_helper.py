@@ -101,10 +101,10 @@ def create_booking(phone: str, service_name: str, start_dt: datetime, minutes: i
     print("EVENT CREATED:", created.get("id"), created.get("htmlLink"), flush=True)
 
     return {
-        "ok": True,
-        "id": created.get("id", ""),
-        "link": created.get("htmlLink", ""),
-    }
+    "ok": True,
+    "id": created.get("id", ""),
+    "link": created.get("htmlLink") or created.get("hangoutLink") or "",
+}
 
 
 def cancel_booking(event_id: str) -> bool:
