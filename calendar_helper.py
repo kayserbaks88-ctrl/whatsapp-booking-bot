@@ -1,115 +1,145 @@
 import os
 import json
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import Dict, Any, List
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-TIMEZONE = os.getenv("TIMEZONE", "Europe/London").strip()
-CALENDAR_ID = (os.getenv("GOOGLE_CALENDAR_ID") or "").strip()
 
-# IMPORTANT: your Render env must be exactly GOOGLE_SERVICE_ACCOUNT_JSON
+TIMEZONE_HINT = os.getenv("TIMEZONE_HINT", "Europe/London")
+GOOGLE_CALENDAR_ID = (os.getenv("GOOGLE_CALENDAR_ID") or "").strip()
+MAX_BARBERS = int(os.getenv("MAX_BARBERS", "1"))
+
 SA_JSON = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 
-def _svc():
+def get_calendar_service():
+
     if not SA_JSON:
-        raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON")
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON env variable missing")
 
-    try:
-        info = json.loads(SA_JSON)
-    except Exception as e:
-        raise RuntimeError(f"Invalid GOOGLE_SERVICE_ACCOUNT_JSON (not JSON): {e}")
+    info = json.loads(SA_JSON)
 
-    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+    credentials = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=SCOPES
+    )
 
+    service = build("calendar", "v3", credentials=credentials)
 
-def list_upcoming(phone: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """List upcoming events tagged with this phone in extendedProperties.private.phone"""
-    if not CALENDAR_ID:
-        return []
-
-    service = _svc()
-    now = datetime.utcnow().isoformat() + "Z"
-
-    resp = service.events().list(
-        calendarId=CALENDAR_ID,
-        timeMin=now,
-        maxResults=50,
-        singleEvents=True,
-        orderBy="startTime",
-        privateExtendedProperty=f"phone={phone}",
-    ).execute()
-
-    items = resp.get("items", [])
-    out: List[Dict[str, Any]] = []
-    for ev in items[:limit]:
-        out.append(
-            {
-                "id": ev.get("id"),
-                "summary": ev.get("summary", ""),
-                "start": (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date"),
-                "end": (ev.get("end") or {}).get("dateTime") or (ev.get("end") or {}).get("date"),
-                "link": ev.get("htmlLink", ""),
-            }
-        )
-    return out
+    return service
 
 
-def is_free(start_dt: datetime, end_dt: datetime) -> bool:
-    """Checks for conflicts."""
-    if not CALENDAR_ID:
-        return True
+def is_free(start_dt: datetime, minutes: int = 30):
 
-    service = _svc()
-    body = {
-        "timeMin": start_dt.isoformat(),
-        "timeMax": end_dt.isoformat(),
-        "timeZone": TIMEZONE,
-        "items": [{"id": CALENDAR_ID}],
-    }
-    fb = service.freebusy().query(body=body).execute()
-    busy = (fb.get("calendars", {}).get(CALENDAR_ID, {}) or {}).get("busy", [])
-    return len(busy) == 0
+    service = get_calendar_service()
 
-
-def create_booking(phone: str, service_name: str, start_dt: datetime, minutes: int = 30) -> Dict[str, Any]:
-    """
-    Creates a calendar event and returns {ok, id, link}.
-    link is the Google Calendar htmlLink (useful for admin/testing).
-    """
-    if not CALENDAR_ID:
-        return {"ok": False, "error": "CALENDAR_NOT_SET"}
-
-    service = _svc()
     end_dt = start_dt + timedelta(minutes=minutes)
 
+    events_result = service.events().list(
+        calendarId=GOOGLE_CALENDAR_ID,
+        timeMin=start_dt.isoformat(),
+        timeMax=end_dt.isoformat(),
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
+
+    events = events_result.get("items", [])
+
+    return len(events) < MAX_BARBERS
+
+
+def create_booking(phone: str, service_name: str, start_dt: datetime, minutes: int = 30, name: str = None) -> Dict[str, Any]:
+
+    service = get_calendar_service()
+
+    end_dt = start_dt + timedelta(minutes=minutes)
+
+    customer = name if name else phone
+
+    events_result = service.events().list(
+        calendarId=GOOGLE_CALENDAR_ID,
+        timeMin=start_dt.isoformat(),
+        timeMax=end_dt.isoformat(),
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
+
+    events = events_result.get("items", [])
+
+    if len(events) >= MAX_BARBERS:
+        return {
+            "status": "full"
+        }
+
     event = {
-        "summary": f"{service_name} - {phone}",
-        "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
-        "end": {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE},
-        "extendedProperties": {"private": {"phone": phone, "service": service_name}},
+        "summary": f"{service_name} | {customer}",
+        "description": f"Customer phone: {phone}",
+        "start": {
+            "dateTime": start_dt.isoformat(),
+            "timeZone": TIMEZONE_HINT,
+        },
+        "end": {
+            "dateTime": end_dt.isoformat(),
+            "timeZone": TIMEZONE_HINT,
+        },
     }
 
-    created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-
-    # Render logs
-    print("EVENT CREATED:", created.get("id"), created.get("htmlLink"), flush=True)
+    created_event = service.events().insert(
+        calendarId=GOOGLE_CALENDAR_ID,
+        body=event
+    ).execute()
 
     return {
-    "ok": True,
-    "id": created.get("id", ""),
-    "link": created.get("htmlLink") or created.get("hangoutLink") or "",
-}
+        "status": "confirmed",
+        "event_id": created_event["id"],
+        "start": start_dt,
+        "end": end_dt
+    }
 
 
-def cancel_booking(event_id: str) -> bool:
-    if not CALENDAR_ID:
-        return False
-    service = _svc()
-    service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
-    return True
+def cancel_booking(event_id):
+
+    service = get_calendar_service()
+
+    service.events().delete(
+        calendarId=GOOGLE_CALENDAR_ID,
+        eventId=event_id
+    ).execute()
+
+    return {"status": "cancelled"}
+
+
+def list_upcoming(limit=10):
+
+    service = get_calendar_service()
+
+    now = datetime.utcnow().isoformat() + "Z"
+
+    events_result = service.events().list(
+        calendarId=GOOGLE_CALENDAR_ID,
+        timeMin=now,
+        maxResults=limit,
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
+
+    return events_result.get("items", [])
+
+
+def next_available_slots(start_dt, minutes=30, limit=3):
+
+    slots = []
+    current = start_dt
+
+    while len(slots) < limit:
+
+        if is_free(current, minutes):
+            slots.append(current)
+
+        current = current + timedelta(minutes=15)
+
+    return slots
