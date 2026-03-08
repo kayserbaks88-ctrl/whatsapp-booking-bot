@@ -274,7 +274,7 @@ def whatsapp():
     )
 
     msg.body(confirmation_text)
-
+    return str(resp)
     
 @app.get("/")
 def health():
