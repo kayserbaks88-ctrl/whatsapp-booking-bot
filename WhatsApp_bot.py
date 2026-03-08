@@ -246,32 +246,31 @@ def whatsapp():
         msg.body(menu_text())
         return str(resp)
 
-    # ================= AWAIT TIME STATE =================
-    if state == "AWAIT_TIME":
+    # ================= AWAIT NAME STATE =================
+    if state == "AWAIT_NAME":
 
         svc_tuple = st.get("service")
-        if not svc_tuple:
+        pending_start = st.get("pending_start")
+
+        if not svc_tuple or not pending_start:
             reset_state(from_number)
             msg.body(menu_text())
             return str(resp)
 
-        dt = parse_datetime(text)
-        if not dt:
-            msg.body("I couldn’t understand that time. Try: Tomorrow 2pm")
+        customer_name = text.strip()
+        if not customer_name:
+            msg.body("Please enter a name for the booking.")
             return str(resp)
 
-        start_dt = dt.astimezone(TZ)
+        start_dt = datetime.fromisoformat(pending_start)
         end_dt = start_dt + timedelta(minutes=svc_tuple[2])
-
-        if not is_free(start_dt, end_dt):
-            msg.body("❌ That slot is taken. Try another time.")
-            return str(resp)
 
         result = create_booking(
             from_number,
             svc_tuple[0],
             start_dt,
             minutes=svc_tuple[2],
+            name=customer_name,
         )
 
         link_line = ""
@@ -293,6 +292,7 @@ def whatsapp():
             f"✂️ Service: {service_name}\n"
             f"📅 Date: {pretty_date}\n"
             f"⏰ Time: {pretty_time}\n"
+            f"👤 Name: {customer_name}\n"
             f"💷 Price: £{price}\n"
             f"⏳ Duration: {duration} mins"
             f"{link_line}\n\n"
