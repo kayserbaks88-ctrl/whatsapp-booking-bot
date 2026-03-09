@@ -180,26 +180,67 @@ def whatsapp():
         msg.body(menu_text())
         return str(resp)
 
-    # ================= AWAIT TIME =================
+    # ==================== AWAIT TIME ====================
     if state == "AWAIT_TIME":
 
         svc_tuple = st.get("service")
+
         if not svc_tuple:
             reset_state(from_number)
             msg.body(menu_text())
             return str(resp)
 
+        # Parse date/time from message
         dt = parse_datetime(text)
+
         if not dt:
-            msg.body("I couldn’t understand that time. Try: Tomorrow 2pm")
+            msg.body("❌ I couldn't understand that time.\nTry something like: Tomorrow 2pm")
             return str(resp)
 
         start_dt = dt.astimezone(TZ)
-        end_dt = start_dt + timedelta(minutes=svc_tuple[2])
 
-        if not is_free(start_dt, end_dt):
+        minutes = svc_tuple[2]
+
+         # Check if slot free
+        if not is_free(start_dt, minutes):
             msg.body("❌ That slot is taken. Try another time.")
             return str(resp)
+
+        
+
+        # ================= CREATE BOOKING =================
+
+        # Get WhatsApp profile name
+        profile_name = request.values.get("ProfileName", "")
+
+        if not profile_name:
+            profile_name = from_number
+
+        booking = create_booking(
+            phone=from_number,
+            service_name=svc_tuple[0],
+            start_dt=start_dt,
+            minutes=minutes,
+            name=profile_name
+        )
+
+        if booking["status"] != "confirmed":
+           msg.body("❌ Could not create booking. Try again.")
+           return str(resp)
+
+
+        # ================= CONFIRMATION =================
+
+        msg.body(
+            f"✅ Booked!\n\n"
+            f"✂️ {svc_tuple[0]}\n"
+            f"📅 {start_dt.strftime('%A %H:%M')}\n\n"
+            f"See you soon 👊🏽"
+        )
+
+        reset_state(from_number)
+
+        return str(resp)
 
         set_state(
             from_number,
