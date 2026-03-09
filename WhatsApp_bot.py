@@ -1,7 +1,6 @@
 import os
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 from llm_helper import llm_extract
@@ -26,9 +25,9 @@ Prices:
 
 ✂️ Haircut — £18
 🔥 Skin Fade — £22
-📏 Shape Up — £12
+🪒 Shape Up — £12
 🧔 Beard Trim — £10
-🪒 Hot Towel Shave — £25
+🪓 Hot Towel Shave — £25
 💨 Blow Dry — £20
 """
 
@@ -36,85 +35,74 @@ Prices:
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
 
+    incoming = request.values.get("Body", "").strip()
+    number = request.values.get("From")
+
     resp = MessagingResponse()
     msg = resp.message()
 
-    from_number = request.values.get("From", "")
-    text = request.values.get("Body", "").strip()
+    service, time = llm_extract(incoming, "Europe/London")
 
-    profile_name = request.values.get("ProfileName", "")
+    # Step 1 – service but no time
+    if service and not time:
 
-    if not profile_name:
-        profile_name = from_number
+        PENDING[number] = {"service": service}
 
-    state = PENDING.get(from_number)
-
-    if state and state["step"] == "await_name":
-
-        state["name"] = text
+        name, price = service
 
         msg.body(
-            f"Confirm booking:\n\n"
-            f"{state['service'][0]} — £{state['service'][1]}\n"
-            f"{state['time'].strftime('%A %H:%M')}\n"
-            f"Name: {text}\n\n"
-            f"Reply YES to confirm."
+            f"💈 BBC Barbers\n\n"
+            f"Great choice — {name} (£{price})\n\n"
+            f"What time would you like?\n"
+            f"Example:\n"
+            f"{name} tomorrow 2pm"
         )
-
-        state["step"] = "confirm"
 
         return str(resp)
 
-    if state and state["step"] == "confirm":
+    # Step 2 – service + time
+    if service and time:
 
-        if text.lower() != "yes":
-            msg.body("Booking cancelled.")
-            PENDING.pop(from_number, None)
+        name, price = service
+
+        if not is_free(time):
+
+            msg.body(
+                "❌ That time is already booked.\n\n"
+                "Please try another time."
+            )
+
             return str(resp)
 
-        service = state["service"]
-        start_dt = state["time"]
-        name = state["name"]
-
-        if not is_free(start_dt, 30):
-
-            msg.body("❌ That time is taken. Try another time.")
-            PENDING.pop(from_number, None)
-            return str(resp)
-
-        booking = create_booking(
-            phone=from_number,
-            service_name=service[0],
-            start_dt=start_dt,
-            minutes=30,
-            name=name
-        )
-
-        link = booking.get("html_link", "")
+        PENDING[number] = {
+            "service": service,
+            "time": time
+        }
 
         msg.body(
-            f"✅ Booked!\n\n"
-            f"{service[0]} — £{service[1]}\n"
-            f"{start_dt.strftime('%A %H:%M')}\n"
-            f"👤 {name}\n\n"
+            f"👍 {name} available at {time.strftime('%A %H:%M')}.\n\n"
+            f"Please reply with your name to confirm booking."
+        )
+
+        return str(resp)
+
+    # Step 3 – name confirmation
+    if number in PENDING and "time" in PENDING[number]:
+
+        name = incoming
+        service_name, price = PENDING[number]["service"]
+        time = PENDING[number]["time"]
+
+        link = create_booking(name, service_name, price, time)
+
+        msg.body(
+            f"✅ Booking confirmed!\n\n"
+            f"{service_name} for {name}\n"
+            f"{time.strftime('%A %H:%M')}\n\n"
             f"📅 Add to calendar:\n{link}"
         )
 
-        PENDING.pop(from_number, None)
-
-        return str(resp)
-
-    data = llm_extract(text)
-
-    if data["service"] and data["datetime"]:
-
-        PENDING[from_number] = {
-            "service": data["service"],
-            "time": data["datetime"].astimezone(TZ),
-            "step": "await_name"
-        }
-
-        msg.body("What name should I book this under?")
+        del PENDING[number]
 
         return str(resp)
 

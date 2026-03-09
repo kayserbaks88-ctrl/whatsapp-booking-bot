@@ -4,11 +4,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
-TIMEZONE_HINT = os.getenv("TIMEZONE_HINT", "Europe/London")
-MAX_BARBERS = int(os.getenv("MAX_BARBERS", "1"))
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-
 
 def get_calendar_service():
 
@@ -22,52 +19,44 @@ def get_calendar_service():
     return service
 
 
-def is_free(start_dt, minutes):
+def is_free(start_time, duration_minutes=30):
 
     service = get_calendar_service()
 
-    end_dt = start_dt + timedelta(minutes=minutes)
+    end_time = start_time + timedelta(minutes=duration_minutes)
 
     events = service.events().list(
         calendarId=GOOGLE_CALENDAR_ID,
-        timeMin=start_dt.isoformat(),
-        timeMax=end_dt.isoformat(),
+        timeMin=start_time.isoformat(),
+        timeMax=end_time.isoformat(),
         singleEvents=True
     ).execute()
 
-    items = events.get("items", [])
-
-    return len(items) < MAX_BARBERS
+    return len(events.get("items", [])) == 0
 
 
-def create_booking(phone, service_name, start_dt, minutes=30, name=""):
+def create_booking(name, service_name, price, start_time):
 
     service = get_calendar_service()
 
-    end_dt = start_dt + timedelta(minutes=minutes)
+    end_time = start_time + timedelta(minutes=30)
 
     event = {
-        "summary": f"{service_name} | {name}",
-        "description": f"Customer phone: {phone}",
+        "summary": f"{service_name} - {name}",
+        "description": f"Service: {service_name}\nPrice: £{price}",
         "start": {
-            "dateTime": start_dt.isoformat(),
-            "timeZone": TIMEZONE_HINT,
+            "dateTime": start_time.isoformat(),
+            "timeZone": "Europe/London",
         },
         "end": {
-            "dateTime": end_dt.isoformat(),
-            "timeZone": TIMEZONE_HINT,
+            "dateTime": end_time.isoformat(),
+            "timeZone": "Europe/London",
         },
     }
 
-    created_event = service.events().insert(
+    created = service.events().insert(
         calendarId=GOOGLE_CALENDAR_ID,
         body=event
     ).execute()
 
-    return {
-        "status": "confirmed",
-        "event_id": created_event["id"],
-        "html_link": created_event.get("htmlLink", ""),
-        "start": start_dt,
-        "end": end_dt
-    }
+    return created.get("htmlLink")

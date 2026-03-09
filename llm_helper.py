@@ -9,7 +9,6 @@ SERVICES = {
     "blow dry": ("Blow Dry", 20),
 }
 
-
 def detect_service(text):
     text = text.lower()
 
@@ -20,21 +19,21 @@ def detect_service(text):
     return None
 
 
-def detect_datetime(text):
+def detect_time(text, timezone):
     dt = dateparser.parse(
         text,
-        settings={"PREFER_DATES_FROM": "future"}
+        settings={
+            "TIMEZONE": timezone,
+            "RETURN_AS_TIMEZONE_AWARE": True,
+            "PREFER_DATES_FROM": "future"
+        }
     )
 
     return dt
 
 
-def llm_extract(text):
-
+def llm_extract(text, timezone):
     service = detect_service(text)
-    dt = detect_datetime(text)
+    time = detect_time(text, timezone)
 
-    return {
-        "service": service,
-        "datetime": dt
-    }
+    return service, time
