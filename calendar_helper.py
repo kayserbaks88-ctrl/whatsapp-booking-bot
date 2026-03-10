@@ -1,13 +1,13 @@
 import os
 import json
 from datetime import timedelta
-
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
 GOOGLE_CALENDAR_ID = os.environ["GOOGLE_CALENDAR_ID"]
 
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 def get_calendar_service():
 
@@ -52,12 +52,12 @@ def create_booking(name, service_name, price, start_time):
         "description": f"{service_name} (£{price})",
         "start": {
             "dateTime": start_time.isoformat(),
-            "timeZone": "Europe/London",
+            "timeZone": "Europe/London"
         },
         "end": {
             "dateTime": end_time.isoformat(),
-            "timeZone": "Europe/London",
-        },
+            "timeZone": "Europe/London"
+        }
     }
 
     created = service.events().insert(

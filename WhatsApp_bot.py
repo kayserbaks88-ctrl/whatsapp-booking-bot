@@ -9,21 +9,25 @@ app = Flask(__name__)
 PENDING = {}
 
 WELCOME = """
-💈 BBC Barbers
+💈 *BBC Barbers*
 
-Send a message like:
+Hi there! 👋
 
-Haircut tomorrow 2pm
-Skin fade Friday 3pm
-Beard trim Monday 5
+How can I help today?
 
-Prices:
+You can book by sending something like:
 
-✂️ Haircut — £18
-🔥 Skin Fade — £22
-🪒 Shape Up — £12
-🧔 Beard Trim — £10
-🪓 Hot Towel Shave — £25
+✂️ Haircut tomorrow 2pm  
+🔥 Skin fade Friday 3pm  
+🧔 Beard trim Monday 5
+
+*Prices*
+
+✂️ Haircut — £18  
+🔥 Skin Fade — £22  
+🪒 Shape Up — £12  
+🧔 Beard Trim — £10  
+🪓 Hot Towel Shave — £25  
 💨 Blow Dry — £20
 """
 
@@ -39,7 +43,15 @@ def whatsapp():
 
     service, time = llm_extract(incoming, "Europe/London")
 
-    # continue booking if already started
+    # Greeting detection
+    if incoming.lower() in ["hi", "hello", "hey"]:
+        msg.body(
+            "Hi! 👋 Welcome to *BBC Barbers*.\n\n"
+            "How can I help today?"
+        )
+        return str(resp)
+
+    # Continue booking flow
     if number in PENDING:
 
         booking = PENDING[number]
@@ -47,14 +59,20 @@ def whatsapp():
         if "time" not in booking and time:
 
             if not is_free(time):
-                msg.body("❌ That time is already booked. Try another.")
+
+                msg.body(
+                    "Ah sorry — that slot has just gone. ❌\n\n"
+                    "Could you try another time?"
+                )
                 return str(resp)
 
             booking["time"] = time
 
             msg.body(
-                f"👍 {booking['service']} available {time.strftime('%A %H:%M')}.\n\n"
-                f"Please reply with your name to confirm."
+                f"👍 That time is available!\n\n"
+                f"*{booking['service']}*\n"
+                f"{time.strftime('%A %H:%M')}\n\n"
+                "Could I take your name to confirm the booking?"
             )
 
             return str(resp)
@@ -71,17 +89,18 @@ def whatsapp():
             )
 
             msg.body(
-                f"✅ Booking confirmed!\n\n"
-                f"{booking['service']} for {name}\n"
+                f"✅ *You're all booked!*\n\n"
+                f"{booking['service']} for *{name}*\n"
                 f"{booking['time'].strftime('%A %H:%M')}\n\n"
-                f"📅 Add to calendar:\n{link}"
+                f"📅 Add to calendar:\n{link}\n\n"
+                f"See you then! 💈"
             )
 
             del PENDING[number]
 
             return str(resp)
 
-    # new booking
+    # New booking request
     if service:
 
         service_name, price = service
@@ -94,15 +113,21 @@ def whatsapp():
             }
 
             msg.body(
-                f"Great choice — {service_name} (£{price})\n\n"
-                f"What time would you like?\n"
-                f"Example: {service_name} tomorrow 2pm"
+                f"💈 Great choice! A *{service_name}* is £{price}.\n\n"
+                f"What time would you like?\n\n"
+                f"For example:\n"
+                f"{service_name} tomorrow 2pm"
             )
 
             return str(resp)
 
         if not is_free(time):
-            msg.body("❌ That time is already booked. Try another.")
+
+            msg.body(
+                "Sorry — that time is already booked. ❌\n\n"
+                "Could you try another time?"
+            )
+
             return str(resp)
 
         PENDING[number] = {
@@ -112,8 +137,10 @@ def whatsapp():
         }
 
         msg.body(
-            f"👍 {service_name} available {time.strftime('%A %H:%M')}.\n\n"
-            f"Please reply with your name to confirm booking."
+            f"👍 Good news — that slot is free!\n\n"
+            f"{service_name}\n"
+            f"{time.strftime('%A %H:%M')}\n\n"
+            "What's your name so I can confirm the booking?"
         )
 
         return str(resp)

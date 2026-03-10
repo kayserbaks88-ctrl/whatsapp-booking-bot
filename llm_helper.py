@@ -9,9 +9,31 @@ SERVICES = {
     "blow": ("Blow Dry", 20),
 }
 
-def detect_service(text):
+FILLERS = [
+    "please",
+    "thanks",
+    "thank you",
+    "can i",
+    "could i",
+    "i want",
+    "book me",
+    "hi",
+    "hello",
+    "hey"
+]
+
+
+def clean_text(text):
 
     text = text.lower()
+
+    for word in FILLERS:
+        text = text.replace(word, "")
+
+    return text
+
+
+def detect_service(text):
 
     for key in SERVICES:
         if key in text:
@@ -37,6 +59,8 @@ def detect_time(text, timezone):
 
 
 def llm_extract(text, timezone):
+
+    text = clean_text(text)
 
     service = detect_service(text)
     time = detect_time(text, timezone)
