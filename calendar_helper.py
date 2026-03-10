@@ -1,17 +1,22 @@
 import os
+import json
 from datetime import timedelta
+
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
+GOOGLE_CALENDAR_ID = os.environ["GOOGLE_CALENDAR_ID"]
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-
 def get_calendar_service():
 
-    credentials = service_account.Credentials.from_service_account_file(
-        "credentials.json",
+    service_account_info = json.loads(
+        os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    )
+
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
         scopes=SCOPES
     )
 
