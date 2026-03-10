@@ -10,16 +10,32 @@ SERVICES = {
 }
 
 def detect_service(text):
+
     text = text.lower()
 
-    for key in SERVICES:
-        if key in text:
-            return SERVICES[key]
+    if "haircut" in text:
+        return SERVICES["haircut"]
+
+    if "fade" in text:
+        return SERVICES["skin fade"]
+
+    if "shape" in text:
+        return SERVICES["shape up"]
+
+    if "beard" in text:
+        return SERVICES["beard trim"]
+
+    if "towel" in text:
+        return SERVICES["hot towel"]
+
+    if "blow" in text:
+        return SERVICES["blow dry"]
 
     return None
 
 
 def detect_time(text, timezone):
+
     dt = dateparser.parse(
         text,
         settings={
@@ -33,6 +49,7 @@ def detect_time(text, timezone):
 
 
 def llm_extract(text, timezone):
+
     service = detect_service(text)
     time = detect_time(text, timezone)
 
