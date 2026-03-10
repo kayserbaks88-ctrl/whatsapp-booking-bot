@@ -26,13 +26,14 @@ def detect_time(text, timezone):
         text,
         settings={
             "TIMEZONE": timezone,
+            "TO_TIMEZONE": timezone,
             "RETURN_AS_TIMEZONE_AWARE": True,
-            "PREFER_DATES_FROM": "future"
+            "PREFER_DATES_FROM": "future",
+            "DATE_ORDER": "DMY"
         }
     )
 
     return dt
-
 
 def llm_extract(text, timezone):
 
