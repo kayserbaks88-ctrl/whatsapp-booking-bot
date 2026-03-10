@@ -7,6 +7,7 @@ GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
+
 def get_calendar_service():
 
     credentials = service_account.Credentials.from_service_account_file(
@@ -19,11 +20,11 @@ def get_calendar_service():
     return service
 
 
-def is_free(start_time, duration_minutes=30):
+def is_free(start_time):
 
     service = get_calendar_service()
 
-    end_time = start_time + timedelta(minutes=duration_minutes)
+    end_time = start_time + timedelta(minutes=30)
 
     events = service.events().list(
         calendarId=GOOGLE_CALENDAR_ID,
@@ -43,7 +44,7 @@ def create_booking(name, service_name, price, start_time):
 
     event = {
         "summary": f"{service_name} - {name}",
-        "description": f"Service: {service_name}\nPrice: £{price}",
+        "description": f"{service_name} (£{price})",
         "start": {
             "dateTime": start_time.isoformat(),
             "timeZone": "Europe/London",

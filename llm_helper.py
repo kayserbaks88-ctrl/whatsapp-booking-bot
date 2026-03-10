@@ -3,33 +3,19 @@ import dateparser
 SERVICES = {
     "haircut": ("Haircut", 18),
     "skin fade": ("Skin Fade", 22),
-    "shape up": ("Shape Up", 12),
-    "beard trim": ("Beard Trim", 10),
-    "hot towel": ("Hot Towel Shave", 25),
-    "blow dry": ("Blow Dry", 20),
+    "shape": ("Shape Up", 12),
+    "beard": ("Beard Trim", 10),
+    "towel": ("Hot Towel Shave", 25),
+    "blow": ("Blow Dry", 20),
 }
 
 def detect_service(text):
 
     text = text.lower()
 
-    if "haircut" in text:
-        return SERVICES["haircut"]
-
-    if "fade" in text:
-        return SERVICES["skin fade"]
-
-    if "shape" in text:
-        return SERVICES["shape up"]
-
-    if "beard" in text:
-        return SERVICES["beard trim"]
-
-    if "towel" in text:
-        return SERVICES["hot towel"]
-
-    if "blow" in text:
-        return SERVICES["blow dry"]
+    for key in SERVICES:
+        if key in text:
+            return SERVICES[key]
 
     return None
 

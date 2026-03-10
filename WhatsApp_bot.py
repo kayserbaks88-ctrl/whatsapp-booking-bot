@@ -1,16 +1,11 @@
-import os
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from zoneinfo import ZoneInfo
 
 from llm_helper import llm_extract
 from calendar_helper import is_free, create_booking
 
 app = Flask(__name__)
 
-TZ = ZoneInfo("Europe/London")
-
-# conversation memory
 PENDING = {}
 
 WELCOME = """
@@ -44,86 +39,24 @@ def whatsapp():
 
     service, time = llm_extract(incoming, "Europe/London")
 
-    # STEP 1 — service detected but no time
-    if service and not time:
+    # waiting for name
+    if number in PENDING:
 
-        PENDING[number] = {"service": service}
+        booking = PENDING[number]
 
-        service_name, price = service
+        name = incoming
 
-        msg.body(
-            f"💈 BBC Barbers\n\n"
-            f"Great choice — {service_name} (£{price})\n\n"
-            f"What time would you like?\n"
-            f"Example:\n"
-            f"{service_name} tomorrow 2pm"
+        link = create_booking(
+            name,
+            booking["service_name"],
+            booking["price"],
+            booking["time"]
         )
-
-        return str(resp)
-
-    # STEP 2 — service and time together
-    if service and time:
-
-        service_name, price = service
-
-        if not is_free(time):
-
-            msg.body(
-                "❌ That time is already booked.\n\n"
-                "Please try another time."
-            )
-
-            return str(resp)
-
-        PENDING[number] = {
-            "service": service,
-            "time": time
-        }
-
-        msg.body(
-            f"👍 {service_name} available at {time.strftime('%A %H:%M')}.\n\n"
-            f"Please reply with your name to confirm."
-        )
-
-        return str(resp)
-
-    # STEP 3 — user sends time after service
-    if number in PENDING and time:
-
-        service = PENDING[number]["service"]
-        service_name, price = service
-
-        if not is_free(time):
-
-            msg.body(
-                "❌ That time is already booked.\n\n"
-                "Please try another time."
-            )
-
-            return str(resp)
-
-        PENDING[number]["time"] = time
-
-        msg.body(
-            f"👍 {service_name} available at {time.strftime('%A %H:%M')}.\n\n"
-            f"Please reply with your name to confirm."
-        )
-
-        return str(resp)
-
-    # STEP 4 — user sends name
-    if number in PENDING and "time" in PENDING[number]:
-
-        customer_name = incoming
-        service_name, price = PENDING[number]["service"]
-        booking_time = PENDING[number]["time"]
-
-        link = create_booking(customer_name, service_name, price, booking_time)
 
         msg.body(
             f"✅ Booking confirmed!\n\n"
-            f"{service_name} for {customer_name}\n"
-            f"{booking_time.strftime('%A %H:%M')}\n\n"
+            f"{booking['service_name']} for {name}\n"
+            f"{booking['time'].strftime('%A %H:%M')}\n\n"
             f"📅 Add to calendar:\n{link}"
         )
 
@@ -131,8 +64,38 @@ def whatsapp():
 
         return str(resp)
 
-    # fallback
-    msg.body(WELCOME)
+    if not service:
+
+        msg.body(WELCOME)
+        return str(resp)
+
+    service_name, price = service
+
+    if not time:
+
+        msg.body(
+            f"Great choice — {service_name} (£{price})\n\n"
+            f"What time would you like?\n"
+            f"Example: {service_name} tomorrow 2pm"
+        )
+
+        return str(resp)
+
+    if not is_free(time):
+
+        msg.body("❌ That time is already booked. Try another time.")
+        return str(resp)
+
+    PENDING[number] = {
+        "service_name": service_name,
+        "price": price,
+        "time": time
+    }
+
+    msg.body(
+        f"👍 {service_name} available {time.strftime('%A %H:%M')}.\n\n"
+        f"Please reply with your name to confirm booking."
+    )
 
     return str(resp)
 
