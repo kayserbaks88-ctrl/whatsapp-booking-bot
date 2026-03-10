@@ -1,68 +1,54 @@
-import dateparser
+import os
+import json
+from openai import OpenAI
 
-SERVICES = {
-    "haircut": ("Haircut", 18),
-    "fade": ("Skin Fade", 22),
-    "shape": ("Shape Up", 12),
-    "beard": ("Beard Trim", 10),
-    "towel": ("Hot Towel Shave", 25),
-    "blow": ("Blow Dry", 20),
-}
-
-FILLERS = [
-    "please",
-    "thanks",
-    "thank you",
-    "can i",
-    "could i",
-    "i want",
-    "book me",
-    "hi",
-    "hello",
-    "hey"
-]
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 
-def clean_text(text):
+def llm_extract(message):
 
-    text = text.lower()
+    prompt = f"""
+You are an AI receptionist for a barber shop.
 
-    for word in FILLERS:
-        text = text.replace(word, "")
+Understand the customer's message and return JSON.
 
-    return text
+Return:
+intent
+service
+time
 
+Intent options:
+greeting
+booking
+availability
+thanks
+other
 
-def detect_service(text):
+Service options:
+haircut
+skin fade
+beard trim
+shape up
 
-    for key in SERVICES:
-        if key in text:
-            return SERVICES[key]
+Message:
+{message}
+"""
 
-    return None
-
-
-def detect_time(text, timezone):
-
-    dt = dateparser.parse(
-        text,
-        settings={
-            "TIMEZONE": timezone,
-            "TO_TIMEZONE": timezone,
-            "RETURN_AS_TIMEZONE_AWARE": True,
-            "PREFER_DATES_FROM": "future",
-            "DATE_ORDER": "DMY"
-        }
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
     )
 
-    return dt
+    content = response.choices[0].message.content
 
+    try:
+        data = json.loads(content)
+    except:
+        data = {
+            "intent": "other",
+            "service": None,
+            "time": None
+        }
 
-def llm_extract(text, timezone):
-
-    text = clean_text(text)
-
-    service = detect_service(text)
-    time = detect_time(text, timezone)
-
-    return service, time
+    return data

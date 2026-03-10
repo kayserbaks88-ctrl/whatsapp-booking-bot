@@ -47,23 +47,9 @@ def create_booking(name, service_name, price, start_time):
 
     end_time = start_time + timedelta(minutes=30)
 
-    emoji = {
-        "Haircut": "✂️",
-        "Skin Fade": "🔥",
-        "Shape Up": "🪒",
-        "Beard Trim": "🧔",
-        "Hot Towel Shave": "🪓",
-        "Blow Dry": "💨"
-    }.get(service_name, "💈")
-
     event = {
-        "summary": f"{emoji} {service_name} | {name}",
-        "description": (
-            f"Customer: {name}\n"
-            f"Service: {service_name}\n"
-            f"Price: £{price}\n\n"
-            f"Booked via TrimTech AI"
-        ),
+        "summary": f"{service_name} | {name}",
+        "description": f"Customer: {name}\nService: {service_name}\nPrice: £{price}",
         "start": {
             "dateTime": start_time.isoformat(),
             "timeZone": "Europe/London"
@@ -80,33 +66,3 @@ def create_booking(name, service_name, price, start_time):
     ).execute()
 
     return created.get("htmlLink")
-
-
-def next_available_slots(start_time):
-
-    slots = []
-    current = start_time
-
-    while len(slots) < 3:
-
-        current = current + timedelta(minutes=30)
-
-        if is_free(current):
-            slots.append(current)
-
-    return slots
-
-
-def find_available_slots(start_time):
-
-    slots = []
-    current = start_time
-
-    while len(slots) < 5:
-
-        current = current + timedelta(minutes=30)
-
-        if is_free(current):
-            slots.append(current)
-
-    return slots

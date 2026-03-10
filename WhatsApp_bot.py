@@ -2,33 +2,22 @@ from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 
 from llm_helper import llm_extract
-from calendar_helper import (
-    is_free,
-    create_booking,
-    next_available_slots,
-    find_available_slots
-)
+from calendar_helper import is_free, create_booking
 
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import dateparser
 
 app = Flask(__name__)
 
 PENDING = {}
 
-WELCOME = """
-💈 *BBC Barbers*
-
-Hi there! 👋
-
-How can I help today?
-
-You can book by sending something like:
-
-✂️ Haircut tomorrow 2pm
-🔥 Skin fade Friday 3pm
-🧔 Beard trim Monday 5
-"""
+SERVICES = {
+    "haircut": ("Haircut", 18),
+    "skin fade": ("Skin Fade", 22),
+    "beard trim": ("Beard Trim", 10),
+    "shape up": ("Shape Up", 12)
+}
 
 
 @app.route("/whatsapp", methods=["POST"])
@@ -40,42 +29,51 @@ def whatsapp():
     resp = MessagingResponse()
     msg = resp.message()
 
-    service, time = llm_extract(incoming, "Europe/London")
+    data = llm_extract(incoming)
 
-    text = incoming.lower()
+    intent = data.get("intent")
+    service = data.get("service")
+    time_text = data.get("time")
+
+    timezone = ZoneInfo("Europe/London")
+
+    if time_text:
+        time = dateparser.parse(
+            time_text,
+            settings={
+                "TIMEZONE": "Europe/London",
+                "RETURN_AS_TIMEZONE_AWARE": True,
+                "PREFER_DATES_FROM": "future"
+            }
+        )
+    else:
+        time = None
 
     # Greeting
-    if text in ["hi", "hello", "hey"]:
+    if intent == "greeting":
+
         msg.body(
             "Hi! 👋 Welcome to BBC Barbers.\n\n"
             "How can I help today?"
         )
+
         return str(resp)
 
-    # Thank you
-    if text in ["thanks", "thank you", "cheers"]:
+    # Thanks
+    if intent == "thanks":
+
         msg.body(
             "You're very welcome! 😊\n\n"
-            "Just message anytime if you need another appointment.\n"
-            "Have a great day! 💈"
+            "Just message anytime if you need another appointment."
         )
+
         return str(resp)
 
-    # Availability questions
-    if any(word in text for word in ["available", "free", "slots"]):
-
-        now = datetime.now(ZoneInfo("Europe/London"))
-
-        slots = find_available_slots(now)
-
-        options = "\n".join(
-            slot.strftime("%A %H:%M") for slot in slots
-        )
+    # Availability question
+    if intent == "availability":
 
         msg.body(
-            "Sure 👍 Here are the next available slots:\n\n"
-            f"{options}\n\n"
-            "Would one of those work for you?"
+            "Sure 👍 What day are you looking for?"
         )
 
         return str(resp)
@@ -85,21 +83,13 @@ def whatsapp():
 
         booking = PENDING[number]
 
-        if "time" not in booking and time:
+        if not booking.get("time") and time:
 
             if not is_free(time):
 
-                suggestions = next_available_slots(time)
-
-                options = "\n".join(
-                    slot.strftime("%A %H:%M") for slot in suggestions
-                )
-
                 msg.body(
                     "Ah sorry — that slot has just gone ❌\n\n"
-                    "I can do:\n\n"
-                    f"{options}\n\n"
-                    "Would one of those work for you?"
+                    "Could you try another time?"
                 )
 
                 return str(resp)
@@ -115,7 +105,7 @@ def whatsapp():
 
             return str(resp)
 
-        if "time" in booking:
+        if booking.get("time"):
 
             name = incoming
 
@@ -127,68 +117,73 @@ def whatsapp():
             )
 
             msg.body(
-                f"✅ *All set, {name}!*\n\n"
-                f"I've booked you in for:\n"
-                f"✂️ {booking['service']}\n"
-                f"📅 {booking['time'].strftime('%A %H:%M')}\n\n"
-                "See you soon! 💈"
+                f"✅ You're all booked {name}!\n\n"
+                f"{booking['service']}\n"
+                f"{booking['time'].strftime('%A %H:%M')}\n\n"
+                "See you soon 💈"
             )
 
             del PENDING[number]
 
             return str(resp)
 
-    # New booking
-    if service:
+    # New booking request
+    if intent == "booking":
 
-        service_name, price = service
+        if service and service in SERVICES:
 
-        if not time:
+            service_name, price = SERVICES[service]
+
+            if not time:
+
+                PENDING[number] = {
+                    "service": service_name,
+                    "price": price
+                }
+
+                msg.body(
+                    f"Great choice! {service_name} is £{price}.\n\n"
+                    "What time would you like?"
+                )
+
+                return str(resp)
+
+            if not is_free(time):
+
+                msg.body(
+                    "Ah sorry — that time is already booked.\n\n"
+                    "Could you try another?"
+                )
+
+                return str(resp)
 
             PENDING[number] = {
                 "service": service_name,
-                "price": price
+                "price": price,
+                "time": time
             }
 
             msg.body(
-                f"💈 Great choice! A *{service_name}* is £{price}.\n\n"
-                "What time would you like?"
+                f"👍 That time is available!\n\n"
+                f"{service_name}\n"
+                f"{time.strftime('%A %H:%M')}\n\n"
+                "What name should I put on the booking?"
             )
 
             return str(resp)
 
-        if not is_free(time):
-
-            suggestions = next_available_slots(time)
-
-            options = "\n".join(
-                slot.strftime("%A %H:%M") for slot in suggestions
-            )
+        else:
 
             msg.body(
-                "Ah sorry — that slot has just gone ❌\n\n"
-                "I can do:\n\n"
-                f"{options}"
+                "Sure 🙂 What service would you like?\n\n"
+                "✂️ Haircut\n🔥 Skin Fade\n🧔 Beard Trim\n🪒 Shape Up"
             )
 
             return str(resp)
 
-        PENDING[number] = {
-            "service": service_name,
-            "price": price,
-            "time": time
-        }
-
-        msg.body(
-            f"👍 That time is available!\n\n"
-            f"{service_name}\n"
-            f"{time.strftime('%A %H:%M')}\n\n"
-            "What name should I put on the booking?"
-        )
-
-        return str(resp)
-
-    msg.body(WELCOME)
+    msg.body(
+        "Hi 👋 How can I help today?"
+    )
 
     return str(resp)
 
