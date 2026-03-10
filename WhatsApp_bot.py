@@ -28,15 +28,6 @@ You can book by sending something like:
 ✂️ Haircut tomorrow 2pm
 🔥 Skin fade Friday 3pm
 🧔 Beard trim Monday 5
-
-Prices:
-
-✂️ Haircut — £18
-🔥 Skin Fade — £22
-🪒 Shape Up — £12
-🧔 Beard Trim — £10
-🪓 Hot Towel Shave — £25
-💨 Blow Dry — £20
 """
 
 
@@ -56,7 +47,7 @@ def whatsapp():
     # Greeting
     if text in ["hi", "hello", "hey"]:
         msg.body(
-            "Hi! 👋 Welcome to *BBC Barbers*.\n\n"
+            "Hi! 👋 Welcome to BBC Barbers.\n\n"
             "How can I help today?"
         )
         return str(resp)
@@ -84,7 +75,7 @@ def whatsapp():
         msg.body(
             "Sure 👍 Here are the next available slots:\n\n"
             f"{options}\n\n"
-            "Just tell me which one you'd like."
+            "Would one of those work for you?"
         )
 
         return str(resp)
@@ -106,8 +97,9 @@ def whatsapp():
 
                 msg.body(
                     "Ah sorry — that slot has just gone ❌\n\n"
-                    "Next available times:\n\n"
-                    f"{options}"
+                    "I can do:\n\n"
+                    f"{options}\n\n"
+                    "Would one of those work for you?"
                 )
 
                 return str(resp)
@@ -127,7 +119,7 @@ def whatsapp():
 
             name = incoming
 
-            link = create_booking(
+            create_booking(
                 name,
                 booking["service"],
                 booking["price"],
@@ -139,9 +131,7 @@ def whatsapp():
                 f"I've booked you in for:\n"
                 f"✂️ {booking['service']}\n"
                 f"📅 {booking['time'].strftime('%A %H:%M')}\n\n"
-                f"📲 Add it to your calendar:\n{link}\n\n"
-                f"If you need to change anything just message me.\n"
-                f"See you soon! 💈"
+                "See you soon! 💈"
             )
 
             del PENDING[number]
@@ -177,7 +167,7 @@ def whatsapp():
 
             msg.body(
                 "Ah sorry — that slot has just gone ❌\n\n"
-                "Next available times:\n\n"
+                "I can do:\n\n"
                 f"{options}"
             )
 

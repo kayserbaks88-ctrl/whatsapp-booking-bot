@@ -47,9 +47,23 @@ def create_booking(name, service_name, price, start_time):
 
     end_time = start_time + timedelta(minutes=30)
 
+    emoji = {
+        "Haircut": "✂️",
+        "Skin Fade": "🔥",
+        "Shape Up": "🪒",
+        "Beard Trim": "🧔",
+        "Hot Towel Shave": "🪓",
+        "Blow Dry": "💨"
+    }.get(service_name, "💈")
+
     event = {
-        "summary": f"{service_name} - {name}",
-        "description": f"{service_name} (£{price})",
+        "summary": f"{emoji} {service_name} | {name}",
+        "description": (
+            f"Customer: {name}\n"
+            f"Service: {service_name}\n"
+            f"Price: £{price}\n\n"
+            f"Booked via TrimTech AI"
+        ),
         "start": {
             "dateTime": start_time.isoformat(),
             "timeZone": "Europe/London"
