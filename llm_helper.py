@@ -2,7 +2,7 @@ import dateparser
 
 SERVICES = {
     "haircut": ("Haircut", 18),
-    "skin fade": ("Skin Fade", 22),
+    "fade": ("Skin Fade", 22),
     "shape": ("Shape Up", 12),
     "beard": ("Beard Trim", 10),
     "towel": ("Hot Towel Shave", 25),
@@ -34,6 +34,7 @@ def detect_time(text, timezone):
     )
 
     return dt
+
 
 def llm_extract(text, timezone):
 
