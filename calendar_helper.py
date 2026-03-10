@@ -66,3 +66,33 @@ def create_booking(name, service_name, price, start_time):
     ).execute()
 
     return created.get("htmlLink")
+
+
+def next_available_slots(start_time):
+
+    slots = []
+    current = start_time
+
+    while len(slots) < 3:
+
+        current = current + timedelta(minutes=30)
+
+        if is_free(current):
+            slots.append(current)
+
+    return slots
+
+
+def find_available_slots(start_time):
+
+    slots = []
+    current = start_time
+
+    while len(slots) < 5:
+
+        current = current + timedelta(minutes=30)
+
+        if is_free(current):
+            slots.append(current)
+
+    return slots
