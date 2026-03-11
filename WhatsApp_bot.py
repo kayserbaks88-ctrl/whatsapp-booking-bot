@@ -35,6 +35,17 @@ def whatsapp():
     service = data.get("service")
     time_text = data.get("time")
 
+    # SIMPLE FALLBACK if AI fails
+    msg = incoming.lower()
+
+    if not intent:
+        if "haircut" in msg or "fade" in msg or "trim" in msg:
+            intent = "book"
+            service = "haircut"
+
+        if "cancel" in msg:
+            intent = "cancel"
+
     timezone = ZoneInfo("Europe/London")
 
     if time_text:
